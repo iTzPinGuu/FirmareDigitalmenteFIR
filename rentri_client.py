@@ -97,6 +97,9 @@ class RentriClient:
         self.service_base_url = f"{self.host_base}{self.FORMULARI_BASE_PATH}"
         self.ca_base_url = f"{self.host_base}{self.CA_BASE_PATH}"
 
+        # Informazioni ambiente utili per il debug (non contiene password o chiavi private).
+        logger.info("RENTRI ambiente=%s endpoint=%s", self.env, self.host_base)
+
         base_id = (issuer or identificativo or "").strip()
         if not base_id:
             raise ValueError("Identificativo / issuer del soggetto obbligatorio.")
