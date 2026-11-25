@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import os
+import io
+import base64
+import logging
+import json
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import quote
 
+import httpx
+import fitz
+from PIL import Image, ImageStat
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,7 +31,53 @@ from usb_signer import UsbSignerError, list_windows_signing_certificates, sign_d
 
 app = FastAPI(title="RENTRI — Gestione FIR digitali")
 
-# Numero unità locale confermato dall'utente. La .env, se valorizzata, prevale.
+
+def _boomer_data_dir() -> Path:
+    """Cartella persistente per le preferenze locali della BOOMER, separata da RENTRI."""
+    configured = os.getenv("RENTRI_BOOMER_DATA_DIR", "").strip()
+    if configured:
+        folder = Path(configured).expanduser()
+    elif os.name == "nt":
+        root = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+        folder = (Path(root) / "TruccoloAngelo" / "RENTRI_BOOMER") if root else (Path.home() / "AppData" / "Local" / "TruccoloAngelo" / "RENTRI_BOOMER")
+    else:
+        folder = Path.home() / ".local" / "share" / "TruccoloAngelo" / "RENTRI_BOOMER"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+BOOMER_DATA_DIR = _boomer_data_dir()
+HIDDEN_FIRS_FILE = BOOMER_DATA_DIR / "hidden_firs.json"
+
+
+def _read_hidden_firs() -> List[Dict[str, Any]]:
+    if not HIDDEN_FIRS_FILE.exists():
+        return []
+    try:
+        parsed = json.loads(HIDDEN_FIRS_FILE.read_text(encoding="utf-8"))
+        items = parsed.get("items", []) if isinstance(parsed, dict) else []
+        return items if isinstance(items, list) else []
+    except (OSError, json.JSONDecodeError):
+        logging.exception("Impossibile leggere l'archivio locale dei formulari nascosti")
+        raise HTTPException(status_code=500, detail="Archivio locale dei formulari nascosti non leggibile. Avvisa l'amministratore; nessun formulario è stato modificato su RENTRI.")
+
+
+def _write_hidden_firs(items: List[Dict[str, Any]]) -> None:
+    temporary = HIDDEN_FIRS_FILE.with_suffix(".json.tmp")
+    payload = {"version": 1, "updated_at": datetime.now(timezone.utc).isoformat(), "items": items}
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, HIDDEN_FIRS_FILE)
+    except OSError as exc:
+        logging.exception("Impossibile salvare l'archivio locale dei formulari nascosti")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="Non è stato possibile salvare l'elenco dei formulari nascosti sul computer. Controlla i permessi della cartella o avvisa l'amministratore.") from exc
+
+# Numero unità locale: va impostato in .env come RENTRI_NUM_ISCR_SITO (nessun valore di default
+# nel codice, per non pubblicare dati specifici dell'operatore in un repository pubblico).
 DEFAULT_NUM_ISCR_SITO = ""
 
 
@@ -229,6 +283,258 @@ async def api_dettaglio(numero_fir: str) -> Dict[str, Any]:
         _raise_api_error(exc)
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"unexpected_error": str(exc)})
+
+
+
+
+@app.get("/api/formulari/{numero_fir}/pdf")
+async def api_formulario_pdf(numero_fir: str) -> Response:
+    """Restituisce il PDF completo del FIR, autenticandosi verso RENTRI."""
+    current = _require_client()
+    pdf_url = f"{current.service_base_url.rstrip('/')}/{quote(numero_fir, safe='')}/pdf"
+    try:
+        headers = current._build_headers(
+            extra_headers={"Accept": "application/json, application/pdf"}
+        )
+        async with httpx.AsyncClient(timeout=current.timeout, follow_redirects=False) as http_client:
+            response = await http_client.get(pdf_url, headers=headers)
+
+        if response.status_code == 204:
+            raise HTTPException(status_code=404, detail={"validation_error": "RENTRI non ha restituito un PDF per questo formulario."})
+        if response.status_code != 200:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = {"raw_response": response.text[:1000]}
+            raise HTTPException(status_code=response.status_code, detail=detail)
+
+        response_body = response.content
+        content_type = response.headers.get("content-type", "").lower()
+        if "json" in content_type or response_body.lstrip().startswith(b"{"):
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail={"pdf_error": "RENTRI ha restituito JSON non leggibile per la stampa PDF."}) from exc
+            encoded_content = payload.get("content") if isinstance(payload, dict) else None
+            if not encoded_content:
+                raise HTTPException(status_code=404, detail={"pdf_error": "La risposta RENTRI non contiene il PDF del formulario."})
+            if isinstance(encoded_content, str):
+                encoded_content = encoded_content.strip()
+                if encoded_content.startswith("data:") and "," in encoded_content:
+                    encoded_content = encoded_content.split(",", 1)[1]
+                try:
+                    pdf_bytes = base64.b64decode("".join(encoded_content.split()), validate=False)
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail={"pdf_error": "Il contenuto PDF Base64 ricevuto da RENTRI non è valido."}) from exc
+            elif isinstance(encoded_content, list):
+                try:
+                    pdf_bytes = bytes(encoded_content)
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail={"pdf_error": "Il contenuto PDF RENTRI non è convertibile in byte."}) from exc
+            else:
+                raise HTTPException(status_code=502, detail={"pdf_error": "Tipo del contenuto PDF RENTRI non supportato."})
+        else:
+            pdf_bytes = response_body
+
+        if not pdf_bytes or b"%PDF-" not in pdf_bytes[:1024]:
+            raise HTTPException(status_code=502, detail={"pdf_error": "La risposta dell'API non contiene un PDF valido."})
+
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in numero_fir)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="{safe_name or "FIR"}.pdf"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException:
+        raise
+    except RentriApiError as exc:
+        _raise_api_error(exc)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Errore download PDF FIR %s", numero_fir)
+        raise HTTPException(status_code=500, detail={"unexpected_error": f"Errore durante il recupero del PDF: {type(exc).__name__}: {exc}"}) from exc
+
+
+@app.get("/api/formulari/{numero_fir}/qr")
+async def api_formulario_qr(
+    numero_fir: str,
+    page: int = Query(default=1, ge=1),
+    x: float = Query(default=479),
+    y: float = Query(default=78),
+    width: float = Query(default=86, gt=0),
+    height: float = Query(default=86, gt=0),
+    scale: Literal["thumb", "large"] = Query(default="thumb"),
+) -> Response:
+    """Scarica il PDF del FIR da RENTRI e restituisce il ritaglio PNG del QR.
+
+    RENTRI documenta questa risposta come JSON con `content` Base64;
+    alcuni ambienti/proxy possono però restituire direttamente i byte PDF.
+    Gestiamo entrambi i formati.
+    """
+    current = _require_client()
+    pdf_url = f"{current.service_base_url.rstrip('/')}/{quote(numero_fir, safe='')}/pdf"
+    try:
+        # L'endpoint RENTRI documentato restituisce application/json con:
+        # {"nome_file": ..., "mime": "application/pdf", "content": "<base64>"}
+        headers = current._build_headers(
+            extra_headers={"Accept": "application/json, application/pdf"}
+        )
+        async with httpx.AsyncClient(timeout=current.timeout, follow_redirects=False) as http_client:
+            response = await http_client.get(pdf_url, headers=headers)
+
+        if response.status_code == 204:
+            raise HTTPException(
+                status_code=404,
+                detail={"validation_error": "RENTRI non ha restituito un PDF per questo formulario."},
+            )
+        if response.status_code != 200:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = {"raw_response": response.text[:1000]}
+            raise HTTPException(status_code=response.status_code, detail=detail)
+
+        response_body = response.content
+        content_type = response.headers.get("content-type", "").lower()
+
+        # Caso 1: risposta documentata JSON con il PDF codificato Base64.
+        if "json" in content_type or response_body.lstrip().startswith(b"{"):
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={"qr_error": "RENTRI ha restituito JSON non leggibile per la stampa PDF."},
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise HTTPException(
+                    status_code=502,
+                    detail={"qr_error": "Formato della risposta PDF RENTRI non riconosciuto."},
+                )
+
+            encoded_content = payload.get("content")
+            if not encoded_content:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"qr_error": "La risposta RENTRI non contiene il PDF del formulario."},
+                )
+
+            if isinstance(encoded_content, str):
+                encoded_content = encoded_content.strip()
+                if encoded_content.startswith("data:") and "," in encoded_content:
+                    encoded_content = encoded_content.split(",", 1)[1]
+                try:
+                    # `string<byte>` nell'OpenAPI RENTRI è una stringa Base64.
+                    pdf_bytes = base64.b64decode("".join(encoded_content.split()), validate=False)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"qr_error": "Il contenuto PDF Base64 ricevuto da RENTRI non è valido."},
+                    ) from exc
+            elif isinstance(encoded_content, list):
+                try:
+                    pdf_bytes = bytes(encoded_content)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"qr_error": "Il contenuto PDF RENTRI non è convertibile in byte."},
+                    ) from exc
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail={"qr_error": "Tipo del contenuto PDF RENTRI non supportato."},
+                )
+        else:
+            # Caso 2: l'endpoint/proxy restituisce direttamente application/pdf.
+            pdf_bytes = response_body
+
+        # Evita di passare a PyMuPDF una risposta JSON/HTML o un PDF vuoto.
+        if not pdf_bytes or b"%PDF-" not in pdf_bytes[:1024]:
+            raise HTTPException(
+                status_code=502,
+                detail={"qr_error": "La risposta dell'API non contiene un PDF valido (firma %PDF- assente)."},
+            )
+
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"qr_error": f"Il PDF restituito da RENTRI non è leggibile: {type(exc).__name__}: {exc}"},
+            ) from exc
+
+        try:
+            if page > len(doc):
+                raise HTTPException(
+                    status_code=404,
+                    detail={"validation_error": f"Pagina {page} non disponibile nel PDF."},
+                )
+
+            pdf_page = doc[page - 1]
+            page_rect = pdf_page.rect
+
+            # Le coordinate fornite sono riferite all'origine in alto a sinistra.
+            # Manteniamo un secondo tentativo con origine in basso a sinistra per
+            # tollerare PDF che usano il sistema di coordinate PDF tradizionale.
+            candidates = [
+                fitz.Rect(x, y, x + width, y + height),
+                fitz.Rect(
+                    x,
+                    page_rect.height - (y + height),
+                    x + width,
+                    page_rect.height - y,
+                ),
+            ]
+
+            best_bytes = None
+            best_score = -1.0
+            zoom = 3.0 if scale == "thumb" else 8.0
+            matrix = fitz.Matrix(zoom, zoom)
+
+            for rect in candidates:
+                clip = rect & page_rect
+                if clip.is_empty:
+                    continue
+                pix = pdf_page.get_pixmap(matrix=matrix, clip=clip, alpha=False)
+                if pix.width <= 0 or pix.height <= 0:
+                    continue
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                gray = img.convert("L")
+                stat = ImageStat.Stat(gray)
+                hist = gray.histogram()
+                dark = sum(hist[:235]) / max(1, gray.width * gray.height)
+                contrast = stat.stddev[0]
+                score = (dark * 2.0) + contrast
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                if score > best_score:
+                    best_score = score
+                    best_bytes = buf.getvalue()
+
+            if best_bytes is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"validation_error": "Impossibile ritagliare il QR dalle coordinate indicate nel PDF."},
+                )
+            return Response(content=best_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
+        finally:
+            doc.close()
+
+    except HTTPException:
+        raise
+    except RentriApiError as exc:
+        _raise_api_error(exc)
+    except Exception as exc:
+        # Il dettaglio effettivo è riportato nel log Python; al client restituiamo
+        # un messaggio diagnostico utile senza esporre token o intestazioni.
+        logging.getLogger(__name__).exception("Errore estrazione QR FIR %s", numero_fir)
+        raise HTTPException(
+            status_code=500,
+            detail={"unexpected_error": f"Errore durante l'estrazione del QR: {type(exc).__name__}: {exc}"},
+        ) from exc
 
 
 @app.post("/api/formulari/{numero_fir}/accettazione")
@@ -506,388 +812,379 @@ HTML_UI = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RENTRI · Firma FIR</title>
+  <title>RENTRI BOOMER · Truccolo Angelo</title>
   <style>
-    :root{
+    :root {
       color-scheme: light;
-      --bg:#f5f7f6;
-      --panel:#ffffff;
-      --panel2:#f8fbf8;
-      --line:#d6e2d9;
-      --text:#1c2a1f;
-      --muted:#5f6f63;
-      --accent:#388E3C;
-      --accent2:#2E7D32;
-      --ok:#2e7d32;
-      --warn:#c48d38;
-      --danger:#bf4d56;
-      --soft:#eef6ef;
+      --bg:#edf2ee; --panel:#fff; --panel-soft:#f7faf7; --line:#d5e0d7;
+      --text:#203126; --muted:#607166; --green:#237a35; --green-dark:#176128;
+      --green-soft:#e9f5eb; --warn:#986416; --warn-bg:#fff6e5;
+      --danger:#a12c37; --danger-bg:#fff0f1; --ok:#246f32; --ok-bg:#eaf7ec;
+      --shadow:0 7px 22px rgba(32,55,39,.08);
     }
     *{box-sizing:border-box}
-    html,body{margin:0; min-height:100%; background:var(--bg); color:var(--text); font:14px/1.45 "Segoe UI",Arial,sans-serif}
-    header{
-      position:sticky; top:0; z-index:20;
-      display:flex; align-items:center; justify-content:space-between; gap:14px;
-      padding:14px 18px; background:rgba(255,255,255,.94); border-bottom:1px solid var(--line);
-      backdrop-filter: blur(10px);
-    }
-    header .title{font-size:18px; font-weight:800; letter-spacing:.2px; color:#1f3c22}
-    header .subtitle{color:var(--muted); font-size:12px; margin-top:3px}
-    .badge{padding:7px 11px; border-radius:999px; border:1px solid #bdd5c1; background:#ecf5ed; color:#225327; font-size:12px; white-space:nowrap}
-    main{max-width:1600px; margin:0 auto; padding:18px}
-    .grid{display:grid; grid-template-columns:minmax(0, 1.68fr) minmax(360px, .92fr); gap:22px; align-items:start}
-    .stack{display:flex; flex-direction:column; gap:16px; min-width:0}
-    .right-panel{position:sticky; top:86px; align-self:start}
-    .detail-grid{display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px}
-    .detail-grid .box{background:var(--soft); border:1px solid #d9e9db; border-radius:14px; padding:12px}
-    .detail-grid .value{font-size:15px; font-weight:750; margin-top:4px; color:#234026; word-break:break-word}
-    @media (max-width: 1300px){ .right-panel{position:static} }
-    @media (max-width: 1150px){ .grid{grid-template-columns:1fr} }
-    @media (max-width: 900px){ .summary,.detail-grid{grid-template-columns:repeat(2, minmax(0,1fr))} }
-    @media (max-width: 640px){ .summary,.detail-grid{grid-template-columns:1fr} }
-    .card{
-      background:linear-gradient(180deg, rgba(255,255,255,.98), rgba(248,251,248,.98));
-      border:1px solid var(--line); border-radius:16px; padding:16px;
-      box-shadow:0 10px 28px rgba(35,58,40,.08);
-    }
-    h2{margin:0 0 10px; font-size:18px}
-    h3{margin:0 0 8px; font-size:15px}
-    p{margin:8px 0}
+    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:15px/1.4 "Segoe UI",Arial,sans-serif}
+    body{display:flex;flex-direction:column}
+    header{height:66px;flex:0 0 66px;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:8px 20px;background:#fff;border-bottom:1px solid var(--line);box-shadow:0 2px 8px rgba(32,55,39,.04);z-index:10}
+    .brand{display:flex;align-items:center;gap:12px;min-width:0}
+    .brand-mark{width:42px;height:42px;display:grid;place-items:center;flex:0 0 42px;border-radius:12px;background:var(--green);color:#fff;font-weight:900;font-size:16px;letter-spacing:-.04em}
+    .brand-title{font-size:18px;font-weight:850;line-height:1.1;letter-spacing:.01em}
+    .brand-subtitle{font-size:11px;color:var(--muted);font-weight:700;letter-spacing:.09em;margin-top:4px}
+    .top-meta{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:0}
+    .badge{display:inline-flex;align-items:center;justify-content:center;padding:7px 11px;border-radius:999px;background:#eaf4ec;border:1px solid #c5ddca;color:#24592e;font-size:12px;font-weight:850;white-space:nowrap}
+    #envBadge[style*="rgb(185, 28, 28)"],#envBadge[style*="#b91c1c"]{background:#b91c1c!important;color:white!important;border-color:#a51d27!important}
+    #subtitle{font-size:11px;color:var(--muted);max-width:330px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
+    /* Gli avvisi restano nel flusso della pagina: non coprono più le istruzioni sottostanti. */
+    .boomer-alert{position:static;top:auto;left:auto;transform:none;z-index:auto;width:min(1900px,calc(100% - 24px));margin:8px auto 0;padding:10px 14px;font-size:14px;font-weight:700;box-shadow:0 4px 12px rgba(20,40,25,.08);white-space:pre-wrap;max-height:104px;overflow-y:auto;flex:0 0 auto}
+    .banner{border-radius:13px;border:1px solid var(--line);background:#f7faf7;color:var(--text);padding:11px 13px}
+    .banner.ok{background:var(--ok-bg);border-color:#b8daba;color:#235b2b}
+    .banner.warn{background:var(--warn-bg);border-color:#efd9a8;color:#6b4a13}
+    .banner.err{background:var(--danger-bg);border-color:#e8b9bf;color:#842a33}
+    .hidden{display:none!important}
+    .boomer-main{width:100%;height:auto;flex:1 1 0;min-height:0;max-width:1900px;margin:0 auto;padding:12px;display:grid;grid-template-columns:minmax(430px,.88fr) minmax(620px,1.32fr);gap:12px;overflow:hidden}
+    .left-column,.right-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0}
+    .right-column{overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:#b8c8bb transparent}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:var(--shadow);min-width:0}
+    .list-panel{display:flex;flex-direction:column;flex:1;min-height:0}
+    .panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+    .heading-main{display:flex;align-items:center;gap:10px;min-width:0}
+    .step-number{width:30px;height:30px;flex:0 0 30px;border-radius:50%;display:grid;place-items:center;background:var(--green);color:#fff;font-weight:900;font-size:15px}
+    h1,h2,h3,p{margin:0}
+    h2{font-size:18px;line-height:1.2;font-weight:850}
+    h3{font-size:15px;font-weight:850}
+    .intro{font-size:12px;color:var(--muted);margin:3px 0 0;line-height:1.35}
+    .toolbar{display:flex;gap:8px;align-items:center;min-width:0}
+    .filterbar{display:grid;grid-template-columns:minmax(120px,1fr) minmax(150px,1.1fr) auto;gap:8px;margin:5px 0 8px}
+    input,select{width:100%;min-width:0;height:44px;background:var(--panel-soft);border:1px solid #cbd9ce;border-radius:10px;padding:9px 11px;color:var(--text);font:inherit;font-size:14px}
+    input:focus,select:focus{outline:3px solid rgba(35,122,53,.18);border-color:var(--green)}
+    input::placeholder{color:#829087}
+    button{min-height:42px;border:1px solid transparent;border-radius:10px;padding:10px 14px;background:var(--green-dark);color:#fff;font:inherit;font-size:14px;font-weight:850;cursor:pointer;transition:background .12s,transform .12s}
+    button:hover{background:var(--green);color:#fff}
+    button:active{transform:translateY(1px)}
+    button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+    button.primary{background:linear-gradient(180deg,#2c913f,#217331);color:#fff;min-height:50px;padding:13px 18px;font-size:16px;box-shadow:0 5px 13px rgba(35,122,53,.18)}
+    button.primary:hover{background:#176128}
+    button.secondary{background:#eff6f0;border-color:#c8dccb;color:#24552d}
+    button.secondary:hover{background:#e2f0e4;color:#184b22}
+    button.danger{background:#a8323c;color:#fff}
+    .search-button{white-space:nowrap;min-width:132px}
+    details{border:1px solid var(--line);border-radius:11px;background:#fbfdfb;padding:8px 10px}
+    details>summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;font-weight:800;color:#35503c}
+    details>summary::-webkit-details-marker{display:none}
+    details>summary::after{content:"Mostra";font-size:11px;color:var(--green);font-weight:850}
+    details[open]>summary::after{content:"Nascondi"}
+    .more-filters{margin-bottom:8px;font-size:12px}
+    .more-filters-content{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}
+    .filter-help{grid-column:1/-1;font-size:11px;color:var(--muted);margin:0}
+    #toggleHiddenFirBtn{min-height:34px;padding:6px 10px;font-size:11px;white-space:nowrap}
+    .technical-settings{grid-column:1/-1}
+    .technical-settings .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+    .table-wrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}
+    table{width:100%;min-width:0;border-collapse:collapse;table-layout:fixed;font-size:13px}
+    th,td{padding:10px 9px;border-bottom:1px solid #e6ede7;text-align:left;vertical-align:middle;overflow-wrap:anywhere}
+    th{position:sticky;top:0;background:#edf5ee;color:#36533c;font-size:11px;text-transform:uppercase;letter-spacing:.04em;z-index:1}
+    th:nth-child(3),td:nth-child(3),th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){display:none}
+    th:nth-child(1){width:27%} th:nth-child(2){width:29%} th:nth-child(4){width:28%} th:nth-child(7){width:16%}
+    tbody tr{cursor:pointer;transition:background .1s}
+    tbody tr:hover{background:#f2f8f3}
+    tbody tr.selected{background:#e3f2e5;box-shadow:inset 4px 0 var(--green);font-weight:700}
+    tbody tr:last-child td{border-bottom:0}
+    tbody td:first-child{font-weight:850;color:#234a2b}
+    .pager{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-top:9px}
+    .pager button{min-height:38px;padding:8px 12px;font-size:13px}
+    #pagingInfo{font-size:12px;color:var(--muted);font-weight:750}
+    .detail-panel{flex:0 0 auto;padding:13px}
+    #detailBanner{margin:7px 0 9px;background:#f4f8f4;font-size:13px}
+    .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+    .summary .box{min-width:0;padding:8px 10px;border:1px solid #dfebe0;border-radius:10px;background:#f6faf6}
+    .summary .tiny,.detail-grid .tiny{font-size:10px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.04em}
+    .summary .value{margin-top:3px;font-size:13px;font-weight:800;color:#294a30;overflow-wrap:anywhere;line-height:1.25}
+    .extra-detail{margin-top:8px;font-size:12px}
+    .extra-detail .detail-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:8px}
+    .detail-grid .box{padding:8px 9px;background:#f6faf6;border:1px solid #dfebe0;border-radius:9px;min-width:0}
+    .detail-grid .value{font-size:12px;font-weight:700;margin-top:3px;overflow-wrap:anywhere}
+    .detail-pre{white-space:pre-wrap;margin:8px 0 0;font:inherit;font-size:12px;max-height:180px;overflow:auto}
+    #reloadDetailBtn{min-height:34px;padding:6px 10px;font-size:11px}
+    .qr-dock{display:flex;align-items:center;gap:10px;margin-top:9px;padding:8px 10px;border:1px solid #dfe9e1;border-radius:11px;background:#fbfdfb;width:100%;min-width:0}
+    .qr-dock.hidden{display:none!important}
+    .qr-label{font-size:11px;color:var(--muted);font-weight:850;text-transform:uppercase;letter-spacing:.05em}
+    .qr-thumb-wrap{display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto}
+    .qr-thumb{width:62px;height:62px;object-fit:contain;border-radius:7px;border:1px solid #dfe8e1;background:#fff}
+    .qr-copy{flex:1;min-width:0}
+    .qr-copy .small-note{font-size:11px;color:var(--muted)}
+    .qr-pdf-button{min-height:38px;padding:8px 12px;font-size:12px;white-space:nowrap}
+    .action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+    .action-grid:has(#acceptanceCard.hidden){grid-template-columns:1fr}
+    #acceptanceCard,#signCard,#closedFirCard{min-width:0;padding:13px}
+    #closedFirCard{background:var(--ok-bg);border-color:#b8daba}
+    #closedFirCard .step-number{background:var(--ok)}
+    #closedFirCard .intro{font-size:13px;color:#315d38}
+    #recipientWaitingCard{background:#fffaf0;border-color:#ecd8a8}
+    #recipientWaitingCard .step-number{background:#b7791f}
+    #recipientWaitingCard .intro{font-size:13px;color:#76551f}
+    #acceptanceCard h2,#signCard h2,#recipientWaitingCard h2{font-size:17px}
+    .action-lead{font-size:12px;color:var(--muted);margin:4px 0 9px;line-height:1.35}
+    .acceptance-fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+    .field{display:grid;gap:5px;min-width:0}
+    .field label{font-size:12px;font-weight:800;color:#43594a}
+    .field input,.field select{height:42px}
+    .acceptance-actions{display:flex;margin-top:9px}
+    .acceptance-actions button{width:100%;min-height:48px}
+    #acceptanceStateHint{font-size:12px;margin:8px 0}
+    .pill{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:5px 9px;border-radius:999px;background:#eaf5eb;border:1px solid #c6dfca;color:#285d31;font-size:10px;font-weight:850;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+    .sign-steps{display:grid;grid-template-columns:1fr;gap:4px;margin:7px 0 9px;font-size:12px;color:#42574a}
+    .sign-step{display:flex;align-items:flex-start;gap:7px}
+    .mini-check{width:18px;height:18px;flex:0 0 18px;border-radius:50%;display:grid;place-items:center;background:#e7f2e9;color:#28723a;font-size:11px;font-weight:900}
+    .cert-actions{display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px;align-items:center}
+    #scanUsbCertsBtn{min-height:40px;padding:8px 11px;font-size:12px;white-space:nowrap}
+    #usbCertSelect{height:40px;font-size:12px}
+    #usbMemoryNote,#roleHint,.small-note{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.3}
+    #usbCertSummary{padding:8px 10px;font-size:12px;margin-top:6px}
+    #usbSignBtn{width:100%;margin-top:10px;min-height:50px;font-size:16px}
+    #rollbackBtn{display:none!important}
+    #signBanner{margin-top:8px;font-size:13px}
+    .debug-tools{padding:9px 11px;font-size:12px;background:#f8faf8}
+    .debug-tools h2{font-size:13px;margin:0}
+    .debug-tools>summary::after{content:"Apri solo se richiesto"}
+    .debug-tools[open]>summary::after{content:"Chiudi"}
+    #debugLog{white-space:pre-wrap;word-break:break-word;max-height:230px;overflow:auto;margin:8px 0 0;padding:10px;background:#f1f5f1;border-radius:8px;font:11px/1.4 Consolas,monospace}
+    .qr-modal,.pdf-modal{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;background:rgba(13,25,16,.72);padding:18px}
+    .qr-modal.hidden,.pdf-modal.hidden{display:none!important}
+    .qr-modal-inner{max-width:min(92vw,850px);max-height:92vh;background:#fff;border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:10px;box-shadow:0 18px 48px rgba(0,0,0,.32)}
+    .qr-modal img{max-width:min(84vw,780px);max-height:78vh;object-fit:contain;border-radius:10px}
+    .pdf-modal-inner{width:min(96vw,1200px);height:min(94vh,900px);background:#fff;border-radius:16px;padding:12px;display:flex;flex-direction:column;gap:9px}
+    .pdf-modal iframe{width:100%;flex:1;min-height:0;border:1px solid var(--line);border-radius:9px}
     .muted{color:var(--muted)}
-    .tiny{font-size:12px}
-    .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-    .field{display:grid; gap:7px; margin-bottom:10px}
-    .field label{font-weight:650; font-size:13px}
-    input,select,textarea{
-      width:100%; min-width:0;
-      background:var(--panel2); color:var(--text);
-      border:1px solid #cfdccf; border-radius:11px; padding:10px 11px; font:inherit;
-    }
-    input:focus,select:focus,textarea:focus{outline:2px solid rgba(56,142,60,.35); outline-offset:2px; border-color:var(--accent)}
-    button{
-      border:1px solid transparent; border-radius:11px; background:var(--accent2); color:white;
-      font-weight:750; padding:10px 14px; cursor:pointer; font-size:13px;
-    }
-    button:hover{background:var(--accent); color:white}
-    button:disabled{opacity:.45; cursor:not-allowed}
-    button.secondary{background:#edf5ee; border-color:#c4dac7; color:#234726}
-    button.secondary:hover{background:#ddefdf; color:#17331a}
-    button.primary{
-      background:linear-gradient(180deg, #4caf50, #388e3c); color:white;
-      font-size:15px; padding:12px 16px; box-shadow:0 10px 22px rgba(56,142,60,.18)
-    }
-    button.primary:hover{background:linear-gradient(180deg, #5cc860, #43a047); color:white}
-    button.danger{background:#c64e57; border-color:#b53f49}
-    button.danger:hover{background:#d66169; color:white}
-    .toolbar{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-    .toolbar > *{flex:1 1 140px}
-    .table-wrap{overflow:auto; border:1px solid var(--line); border-radius:12px; margin-top:10px}
-    table{width:100%; border-collapse:collapse; min-width:980px; font-size:12.5px}
-    th,td{padding:10px 9px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top}
-    th{position:sticky; top:0; background:#edf5ee; color:#355339; font-weight:700}
-    tbody tr{cursor:pointer}
-    tbody tr:hover{background:#f1f7f2}
-    tbody tr.selected{background:#e1f0e2; box-shadow:inset 3px 0 var(--accent)}
-    .pager{display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap}
-    .banner{
-      border-radius:14px; padding:12px 14px; border:1px solid var(--line);
-      background:#f5faf5; color:var(--text)
-    }
-    .banner.ok{border-color:#b7dbbc; background:#ebf8ec}
-    .banner.err{border-color:#efc3c8; background:#fff2f3}
-    .banner.warn{border-color:#eed7b0; background:#fff8ea}
-    .summary{
-      display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:12px
-    }
-    .summary .box{
-      background:var(--soft); border:1px solid #d9e9db; border-radius:14px; padding:12px
-    }
-    .summary .value{font-size:16px; font-weight:750; margin-top:4px; color:#234026}
-    .pill{display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border-radius:999px; background:#e8f5e9; border:1px solid #c4e1c7; color:#2c5e30; font-size:11px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; white-space:nowrap}
-    .pill.ok{background:#e2f3e3; border-color:#a9d8af; color:#2e7d32}
-    .pill.warn{background:#fff3d6; border-color:#ebd09a; color:#8d632e}
-    .pill.err{background:#fdebee; border-color:#efb9c0; color:#94434b}
-    .spaced{margin-top:12px}
-    .hidden{display:none !important}
-    details.debug{border:1px solid var(--line); border-radius:14px; background:#fbfdfb; padding:10px 12px}
-    details.debug summary{cursor:pointer; font-weight:700}
-    details.debug pre{
-      white-space:pre-wrap; word-break:break-word; margin:10px 0 0;
-      max-height:320px; overflow:auto; background:#f6faf6; border:1px solid #dbe8dd;
-      padding:12px; border-radius:10px; color:#314234; font-size:12px;
-    }
-    .small-note{font-size:12px; color:var(--muted); margin-top:6px}
-    .checkbox{display:flex; gap:8px; align-items:center; margin-top:4px}
-    .checkbox input{width:auto}
-    .certline{font-size:13px; color:#355339}
-    .right-panel{position:static; border-left:1px solid rgba(214,226,217,.65); padding-left:8px}
-    @media (max-width: 1100px){ .grid{grid-template-columns:1fr} .summary{grid-template-columns:1fr} .right-panel{position:static; border-left:none; padding-left:0} }
-  
-    .detail-pre{white-space:pre-wrap; margin:0; font:inherit; color:inherit; line-height:1.45;}
-</style>
+    @media (max-width:1250px){.boomer-main{grid-template-columns:minmax(360px,.9fr) minmax(520px,1.1fr)}.summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+    @media (max-width:1000px){html,body{height:auto;min-height:100%;overflow:auto}.boomer-main{height:auto;min-height:calc(100vh - 66px);grid-template-columns:1fr;overflow:visible}.left-column{min-height:520px}.right-column{overflow:visible}.table-wrap{min-height:360px}.summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+    @media (max-width:650px){header{padding:8px 10px}.brand-title{font-size:15px}.brand-mark{width:36px;height:36px;flex-basis:36px}#subtitle{display:none}.boomer-main{padding:8px}.filterbar{grid-template-columns:1fr 1fr}.search-button{grid-column:1/-1}.action-grid{grid-template-columns:1fr!important}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.acceptance-fields{grid-template-columns:1fr 1fr}.qr-dock{flex-wrap:wrap}.qr-pdf-button{flex:1}}
+  </style>
 </head>
 <body>
 <header>
-  <div>
-    <div class="title">Truccolo Angelo · FIR RENTRI</div>
-    <div class="subtitle" id="subtitle">Versione DEMO · firma USB</div>
+  <div class="brand">
+    <div class="brand-mark">TA</div>
+    <div>
+      <div class="brand-title">Truccolo Angelo · Gestione FIR</div>
+      <div class="brand-subtitle">MODALITÀ SEMPLICE · PROCEDURA GUIDATA</div>
+    </div>
   </div>
-  <span class="badge" id="envBadge">DEMO</span>
+  <div class="top-meta">
+    <span class="badge" id="envBadge">AMBIENTE</span>
+    <span class="badge" id="sitePill">Configurazione</span>
+    <span id="subtitle">Connessione al servizio RENTRI…</span>
+  </div>
 </header>
+<div id="signBanner" class="banner hidden boomer-alert" role="status" aria-live="polite"></div>
 
-<main class="grid">
-  <section class="stack">
-    <div class="card">
-      <div class="row" style="justify-content:space-between; align-items:flex-start">
-        <div>
-          <h2>Trova il FIR</h2>
-          <p class="muted tiny">Cerca un formulario e aprilo per vedere se è già pronto per l'accettazione oppure per la firma con chiavetta.</p>
+<main class="boomer-main">
+  <section class="left-column">
+    <div class="card list-panel">
+      <div class="panel-heading">
+        <div class="heading-main">
+          <span class="step-number">1</span>
+          <div>
+            <h2>Scegli il formulario</h2>
+            <p class="intro">Seleziona una riga dall’elenco per visualizzare i dati e le operazioni disponibili.</p>
+          </div>
         </div>
-        <span class="pill" id="sitePill">Configurazione attiva</span>
       </div>
 
-      <div class="toolbar spaced">
-        <input id="searchNumeroFir" placeholder="Numero FIR" />
-        <input id="searchEer" placeholder="Codice EER" maxlength="8" />
-      </div>
-      <div class="toolbar">
-        <select id="searchVista">
-          <option value="TUTTI">Tutti i FIR</option>
-          <option value="ACCETTAZIONE">Solo da accettare</option>
-          <option value="FIRMA">In firma</option>
+      <div class="filterbar">
+        <input id="searchNumeroFir" placeholder="Cerca numero FIR" aria-label="Cerca per numero FIR" />
+        <select id="searchVista" aria-label="Tipo di formulari da visualizzare">
+          <option value="ACCETTAZIONE" selected>Da accettare</option>
+          <option value="FIRMA">Da firmare</option>
+          <option value="TUTTI">Tutti i formulari</option>
           <option value="ACCETTATI">Già accettati</option>
           <option value="PARZIALI">Accettati parzialmente</option>
         </select>
-        <select id="pageSizeSelect" aria-label="Righe per pagina">
-          <option value="5">5 righe</option>
-          <option value="10">10 righe</option>
-          <option value="20">20 righe</option>
-          <option value="50">50 righe</option>
-          <option value="100">100 righe</option>
-        </select>
-        <button id="searchBtn" class="primary" onclick="loadList(1)">Cerca</button>
+        <button id="searchBtn" class="primary search-button" onclick="loadList(1)">AGGIORNA ELENCO</button>
       </div>
 
-      <details class="debug spaced">
-        <summary>Impostazioni tecniche</summary>
-        <div class="small-note">Qui trovi i parametri usati dal gestionale. Non servono per l'uso quotidiano.</div>
-        <div class="toolbar spaced">
-          <input id="numIscrSito" placeholder="NumIscrSito" />
-          <input id="identificativoSoggetto" placeholder="Identificativo soggetto" />
+      <details class="more-filters">
+        <summary>Altri filtri (facoltativi) e impostazioni</summary>
+        <div class="more-filters-content">
+          <input id="searchEer" placeholder="Codice EER" maxlength="8" aria-label="Codice EER" />
+          <select id="searchVisibility" aria-label="Visualizzazione formulari">
+            <option value="VISIBILI" selected>Formulari normali</option>
+            <option value="NASCOSTI">Formulari nascosti (archivio)</option>
+          </select>
+          <select id="pageSizeSelect" aria-label="Numero di formulari per pagina">
+            <option value="5">5 formulari</option><option value="10">10 formulari</option>
+            <option value="20">20 formulari</option><option value="50">50 formulari</option>
+            <option value="100">100 formulari</option>
+          </select>
+          <p class="filter-help">I formulari nascosti restano salvati su questo computer e non vengono cancellati da RENTRI. Nell’archivio trovi tutti i FIR nascosti, indipendentemente dallo stato.</p>
+          <details class="technical-settings">
+            <summary>Impostazioni tecniche (non modificare)</summary>
+            <div class="small-note">Questi valori sono normalmente caricati dalla configurazione del programma. Modificarli solo su indicazione dell'amministratore.</div>
+            <div class="settings-grid">
+              <input id="numIscrSito" placeholder="Numero iscrizione unità locale" aria-label="Numero iscrizione unità locale" />
+              <input id="identificativoSoggetto" placeholder="Identificativo soggetto" aria-label="Identificativo soggetto" />
+            </div>
+          </details>
         </div>
-        <div class="small-note">Se lasci vuoti questi campi, il programma usa i valori della configurazione salvata.</div>
       </details>
 
       <div class="table-wrap">
         <table>
-          <thead>
-            <tr>
-              <th>Numero FIR</th>
-              <th>Produttore</th>
-              <th>Trasportatore</th>
-              <th>Destinatario</th>
-              <th>EER</th>
-              <th>Quantità</th>
-              <th>Stato</th>
-            </tr>
-          </thead>
-          <tbody id="tbody">
-            <tr><td colspan="7" class="muted">Caricamento…</td></tr>
-          </tbody>
+          <thead><tr><th>Numero FIR</th><th>Produttore</th><th>Trasportatore</th><th>Destinatario</th><th>EER</th><th>Quantità</th><th>Stato</th></tr></thead>
+          <tbody id="tbody"><tr><td colspan="7" class="muted">Caricamento formulari…</td></tr></tbody>
         </table>
       </div>
-
       <div class="pager">
-        <button class="secondary" id="prevBtn" onclick="changePage(-1)" disabled>← Precedente</button>
-        <span class="tiny muted" id="pagingInfo">Pagina 1</span>
-        <button class="secondary" id="nextBtn" onclick="changePage(1)" disabled>Successiva →</button>
+        <button class="secondary" id="prevBtn" onclick="changePage(-1)" disabled>← Precedenti</button>
+        <span id="pagingInfo">Pagina 1</span>
+        <button class="secondary" id="nextBtn" onclick="changePage(1)" disabled>Successivi →</button>
       </div>
     </div>
-
-    <div class="card">
-      <h2>Dettaglio FIR</h2>
-      <div class="banner" id="detailBanner">Seleziona un FIR dall'elenco.</div>
-      <div class="summary spaced">
-        <div class="box">
-          <div class="tiny muted">Numero FIR</div>
-          <div class="value" id="detailNum">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Stato</div>
-          <div class="value" id="detailStatus">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Produttore</div>
-          <div class="value" id="detailProd">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Trasportatore</div>
-          <div class="value" id="detailTransport">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Destinatario</div>
-          <div class="value" id="detailDest">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Quantità presunta</div>
-          <div class="value" id="detailQty">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">EER</div>
-          <div class="value" id="detailEer">—</div>
-        </div>
-      </div>
-
-      <div class="detail-grid spaced">
-        <div class="box">
-          <div class="tiny muted">Data emissione</div>
-          <div class="value" id="detailEmissione">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Data creazione</div>
-          <div class="value" id="detailCreazione">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Inizio trasporto</div>
-          <div class="value" id="detailTrasportoInizio">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Accettazione</div>
-          <div class="value" id="detailAccettazione">—</div>
-        </div>
-
-        <div class="box">
-          <div class="tiny muted">Targa motrice</div>
-          <div class="value" id="detailTargaMotrice">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Targa rimorchio</div>
-          <div class="value" id="detailTargaRimorchio">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Intermediario</div>
-          <div class="value" id="detailIntermediario">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Attività / operazione</div>
-          <div class="value" id="detailAttivita">—</div>
-        </div>
-
-        <div class="box">
-          <div class="tiny muted">Visibilità acquisita</div>
-          <div class="value" id="detailVisibilita">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Trasformato in cartaceo</div>
-          <div class="value" id="detailCartaceo">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Versione</div>
-          <div class="value" id="detailVersione">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Blocco</div>
-          <div class="value" id="detailBlocco">—</div>
-        </div>
-      </div>
-
-      <div class="detail-grid spaced">
-        <div class="box">
-          <div class="tiny muted">Produttore</div>
-          <div class="value" id="detailProdFull">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Trasportatori</div>
-          <div class="value" id="detailTransportersFull">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Destinatari</div>
-          <div class="value" id="detailRecipientsFull">—</div>
-        </div>
-        <div class="box">
-          <div class="tiny muted">Intermediari</div>
-          <div class="value" id="detailIntermediariesFull">—</div>
-        </div>
-      </div>
-
-      <div class="box spaced" style="grid-column:1/-1">
-          <div class="tiny muted">Scheda formulario</div>
-          <pre class="detail-pre" id="detailNarrative">Seleziona un FIR dall'elenco.</pre>
-        </div>
-
-      <div class="row spaced">
-        <button class="secondary" id="reloadDetailBtn" onclick="reloadDetail()" disabled>Aggiorna dettaglio</button>
-      </div>
-    </div>
-
-    <div class="card hidden" id="acceptanceCard">
-      <div class="row" style="justify-content:space-between; align-items:flex-start">
-        <div>
-          <h2>Accettazione FIR</h2>
-          <p class="muted tiny">Inserisci quantità accettata e orario. Il peso presunto viene proposto come valore di partenza.</p>
-        </div>
-        <span class="pill">Solo se richiesta</span>
-      </div>
-
-      <div class="banner spaced" id="acceptanceStateHint">La sezione compare solo quando il FIR è in attesa di accettazione.</div>
-
-      <div class="toolbar spaced">
-        <select id="acceptanceType">
-          <option value="A">Accettato integralmente</option>
-          <option value="P">Accettato parzialmente</option>
-          <option value="R">Respinto totalmente</option>
-        </select>
-        <input id="acceptedQuantity" type="number" min="0" step="0.001" placeholder="Peso presunto" />
-      </div>
-      <div class="toolbar">
-        <input id="arrivalDateTime" type="datetime-local" />
-        <button class="primary" id="acceptanceBtn" onclick="sendAcceptance()">Conferma accettazione</button>
-      </div>
-    </div>
-
   </section>
 
-  <section class="stack right-panel">
-    <div class="card">
-      <div class="row" style="justify-content:space-between; align-items:flex-start">
-        <div>
-          <h2>Firma FIR</h2>
-          <p class="muted tiny">Seleziona la chiavetta e premi Firma FIR. Il programma usa il ruolo corretto del formulario in modo automatico.</p>
+  <section class="right-column">
+    <div class="card detail-panel">
+      <div class="panel-heading">
+        <div class="heading-main">
+          <span class="step-number">2</span>
+          <div>
+            <h2>Controlla il formulario</h2>
+            <p class="intro">Verifica soprattutto numero, destinatario e stato prima di procedere.</p>
+          </div>
         </div>
-        <span class="pill" id="modePill">DEMO</span>
+        <div class="toolbar" style="flex-wrap:wrap;justify-content:flex-end">
+          <button class="secondary" id="toggleHiddenFirBtn" type="button" onclick="toggleHiddenSelectedFir()" disabled>Nascondi formulario</button>
+          <button class="secondary" id="reloadDetailBtn" onclick="reloadDetail()" disabled>Aggiorna dati</button>
+        </div>
+      </div>
+      <div class="banner" id="detailBanner">Seleziona un formulario dall’elenco a sinistra.</div>
+      <div id="detailData" class="hidden">
+        <div class="summary">
+          <div class="box"><div class="tiny muted">Numero FIR</div><div class="value" id="detailNum">—</div></div>
+          <div class="box"><div class="tiny muted">Stato</div><div class="value" id="detailStatus">—</div></div>
+          <div class="box"><div class="tiny muted">Produttore</div><div class="value" id="detailProd">—</div></div>
+          <div class="box"><div class="tiny muted">Trasportatore</div><div class="value" id="detailTransport">—</div></div>
+          <div class="box"><div class="tiny muted">Destinatario</div><div class="value" id="detailDest">—</div></div>
+          <div class="box"><div class="tiny muted">Quantità presunta</div><div class="value" id="detailQty">—</div></div>
+          <div class="box"><div class="tiny muted">Codice EER</div><div class="value" id="detailEer">—</div></div>
+        </div>
+        <details class="extra-detail">
+          <summary>Altri dati del formulario (facoltativi)</summary>
+          <div class="detail-grid">
+            <div class="box"><div class="tiny muted">Data emissione</div><div class="value" id="detailEmissione">—</div></div>
+            <div class="box"><div class="tiny muted">Data creazione</div><div class="value" id="detailCreazione">—</div></div>
+            <div class="box"><div class="tiny muted">Inizio trasporto</div><div class="value" id="detailTrasportoInizio">—</div></div>
+            <div class="box"><div class="tiny muted">Accettazione</div><div class="value" id="detailAccettazione">—</div></div>
+            <div class="box"><div class="tiny muted">Targa motrice</div><div class="value" id="detailTargaMotrice">—</div></div>
+            <div class="box"><div class="tiny muted">Targa rimorchio</div><div class="value" id="detailTargaRimorchio">—</div></div>
+            <div class="box"><div class="tiny muted">Intermediario</div><div class="value" id="detailIntermediario">—</div></div>
+            <div class="box"><div class="tiny muted">Attività / operazione</div><div class="value" id="detailAttivita">—</div></div>
+            <div class="box"><div class="tiny muted">Visibilità acquisita</div><div class="value" id="detailVisibilita">—</div></div>
+            <div class="box"><div class="tiny muted">Trasformato in cartaceo</div><div class="value" id="detailCartaceo">—</div></div>
+            <div class="box"><div class="tiny muted">Versione</div><div class="value" id="detailVersione">—</div></div>
+            <div class="box"><div class="tiny muted">Blocco</div><div class="value" id="detailBlocco">—</div></div>
+            <div class="box"><div class="tiny muted">Produttore</div><div class="value" id="detailProdFull">—</div></div>
+            <div class="box"><div class="tiny muted">Trasportatori</div><div class="value" id="detailTransportersFull">—</div></div>
+            <div class="box"><div class="tiny muted">Destinatari</div><div class="value" id="detailRecipientsFull">—</div></div>
+            <div class="box"><div class="tiny muted">Intermediari</div><div class="value" id="detailIntermediariesFull">—</div></div>
+          </div>
+          <details class="spaced" id="detailNarrativePanel">
+            <summary>Visualizza scheda completa</summary>
+            <pre class="detail-pre" id="detailNarrative"></pre>
+          </details>
+        </details>
+      </div>
+      <div class="qr-dock hidden" id="qrDock" title="Anteprima QR del formulario">
+        <div class="qr-thumb-wrap" onclick="openQrModal()"><img id="qrThumb" class="qr-thumb" alt="Anteprima QR del formulario" /></div>
+        <div class="qr-copy"><div class="qr-label">QR del formulario</div><div class="small-note">Clicca sul codice per ingrandirlo.</div></div>
+        <button class="secondary qr-pdf-button" id="openPdfBtn" type="button" onclick="openPdfModal()">Apri PDF completo</button>
+      </div>
+    </div>
+
+    <div class="action-grid">
+      <div class="card hidden" id="acceptanceCard">
+        <div class="panel-heading">
+          <div class="heading-main"><span class="step-number">3</span><div><h2>Registra l’accettazione</h2><p class="intro">Compila i dati dell’arrivo. Controllali prima di confermare.</p></div></div>
+          <span class="pill">Da completare</span>
+        </div>
+        <div class="banner acceptance-hint" id="acceptanceStateHint">La scheda comparirà solo se l’accettazione compete a Truccolo Angelo.</div>
+        <div class="acceptance-fields">
+          <div class="field"><label for="acceptanceType">Esito</label><select id="acceptanceType"><option value="A">Accettato integralmente</option><option value="P">Accettato parzialmente</option><option value="R">Respinto totalmente</option></select></div>
+          <div class="field"><label for="acceptedQuantity">Quantità accettata</label><input id="acceptedQuantity" type="number" min="0" step="0.001" placeholder="Inserisci il peso" /></div>
+          <div class="field"><label for="arrivalDate">Data di arrivo</label><input id="arrivalDate" type="date" autocomplete="off" aria-label="Data di arrivo" /></div>
+          <div class="field"><label for="arrivalTime">Ora di arrivo</label><input id="arrivalTime" type="time" autocomplete="off" aria-label="Ora di arrivo" /></div>
+        </div>
+        <div class="acceptance-actions"><button class="primary" id="acceptanceBtn" onclick="sendAcceptance()">CONFERMA ACCETTAZIONE</button></div>
       </div>
 
-      <div class="field">
-        <label for="usbCertSelect">Chiavetta / certificato</label>
-        <div class="row">
-          <button class="secondary" id="scanUsbCertsBtn" onclick="loadUsbCertificates()" type="button">Rileva chiavetta</button>
-          <select id="usbCertSelect" style="min-width:220px" aria-label="Certificato di firma su chiavetta">
-            <option value="">Prima rileva la chiavetta collegata</option>
-          </select>
+      <div class="card closed-state-card hidden" id="closedFirCard" role="status" aria-live="polite">
+        <div class="panel-heading">
+          <div class="heading-main">
+            <span class="step-number">✓</span>
+            <div>
+              <h2 id="closedFirTitle">Formulario già accettato</h2>
+              <p class="intro" id="closedFirText">L'accettazione risulta già registrata. Non occorre apporre un'altra firma da questa schermata.</p>
+            </div>
+          </div>
+          <span class="pill">Operazione conclusa</span>
         </div>
-        <div id="usbMemoryNote" class="small-note">Ultima chiavetta usata: nessuna.</div>
+      </div>
+
+      <div class="card recipient-waiting-card hidden" id="recipientWaitingCard" role="status" aria-live="polite">
+        <div class="panel-heading">
+          <div class="heading-main">
+            <span class="step-number">!</span>
+            <div>
+              <h2>In attesa del destinatario</h2>
+              <p class="intro" id="recipientWaitingText">L'accettazione e la firma di questo passaggio spettano al destinatario indicato nel formulario.</p>
+            </div>
+          </div>
+          <span class="pill">Nessuna azione richiesta</span>
+        </div>
+        <div class="small-note">Non inserire dati di accettazione e non apporre firme da questa schermata. Se ritieni che il destinatario sia errato, avvisa l'amministratore.</div>
+      </div>
+
+      <div class="card" id="signCard">
+        <div class="panel-heading">
+          <div class="heading-main"><span class="step-number" id="signStepNumber">3</span><div><h2>Firma il formulario</h2><p class="intro">Inserisci la chiavetta USB e controlla il nominativo del certificato.</p></div></div>
+          <span class="pill" id="modePill">AMBIENTE</span>
+        </div>
+        <div class="sign-steps">
+          <div class="sign-step"><span class="mini-check">1</span><span>Collega la chiavetta USB al computer.</span></div>
+          <div class="sign-step"><span class="mini-check">2</span><span>Rileva e seleziona il certificato corretto.</span></div>
+          <div class="sign-step"><span class="mini-check">3</span><span>Premi il pulsante verde per firmare.</span></div>
+        </div>
+        <div class="cert-actions">
+          <button class="secondary" id="scanUsbCertsBtn" onclick="loadUsbCertificates()" type="button">RILEVA CHIAVETTA</button>
+          <select id="usbCertSelect" aria-label="Certificato di firma"><option value="">Collega la chiavetta e rilevala</option></select>
+        </div>
+        <div id="usbMemoryNote">Nessuna chiavetta selezionata.</div>
         <div id="usbCertSummary" class="banner hidden"></div>
-        <div class="small-note" id="roleHint">La firma si adatta automaticamente al ruolo previsto dal FIR.</div>
-      </div>
-
-      <div class="row">
-        <button class="primary" id="usbSignBtn" onclick="signWithUsb()" disabled>Firma FIR</button>
+        <div class="small-note" id="roleHint">Seleziona un formulario per verificare se è pronto per la firma.</div>
+        <button class="primary" id="usbSignBtn" onclick="signWithUsb()" disabled>FIRMA IL FORMULARIO</button>
         <button class="secondary" id="rollbackBtn" onclick="rollbackSignature()" disabled>Annulla ultima firma</button>
       </div>
-
-      <div id="signBanner" class="banner hidden spaced"></div>
     </div>
 
-    <div class="card">
-      <h2>Debug tecnico</h2>
-      <p class="muted tiny">Area riservata ai dettagli tecnici, ai JSON completi e agli errori del servizio. Qui trovi tutto ciò che serve solo in caso di problema.</p>
-      <details class="debug" open>
-        <summary>Apri / chiudi log tecnico</summary>
-        <pre id="debugLog">Nessun dato tecnico ancora registrato.</pre>
-      </details>
-    </div>
+    <details class="debug-tools">
+      <summary><h2>Assistenza tecnica</h2></summary>
+      <p class="small-note">Aprire questo riquadro solo se richiesto dall’amministratore. Contiene i messaggi tecnici utili per risolvere eventuali problemi.</p>
+      <pre id="debugLog">Nessun dato tecnico ancora registrato.</pre>
+    </details>
   </section>
 </main>
+
+<div class="qr-modal hidden" id="qrModal" role="dialog" aria-modal="true" aria-label="QR del formulario" onclick="closeQrModal(event)">
+  <div class="qr-modal-inner" onclick="event.stopPropagation()">
+    <div class="toolbar" style="justify-content:space-between"><strong>QR del formulario</strong><button class="secondary" type="button" onclick="closeQrModal()">Chiudi</button></div>
+    <img id="qrModalImg" alt="QR ingrandito del formulario" />
+  </div>
+</div>
+<div class="pdf-modal hidden" id="pdfModal" role="dialog" aria-modal="true" aria-label="PDF completo del formulario" onclick="closePdfModal(event)">
+  <div class="pdf-modal-inner" onclick="event.stopPropagation()">
+    <div class="toolbar" style="justify-content:space-between"><strong id="pdfModalTitle">PDF completo del formulario</strong><button class="secondary" type="button" onclick="closePdfModal()">Chiudi PDF</button></div>
+    <iframe id="pdfFrame" title="PDF completo del formulario" src="about:blank"></iframe>
+  </div>
+</div>
 
 <script>
   const state = {
@@ -908,7 +1205,11 @@ HTML_UI = r"""<!DOCTYPE html>
     usbHashCertThumb: '',
     usbHashCertBase64: '',
     acceptanceVisible: false,
+    acceptanceSubmittedForFir: '',
     selectedSuggestedQuantity: '',
+    runtimeInfo: null,
+    hiddenFirEntries: [],
+    hiddenFirConfigLoaded: false,
   };
 
   const STORAGE = {
@@ -918,6 +1219,8 @@ HTML_UI = r"""<!DOCTYPE html>
     identificativoSoggetto: 'rentri_identificativo_soggetto',
     pageSize: 'rentri_page_size',
   };
+
+  const QR_CROP = { page: 1, x: 479, y: 78, width: 86, height: 86 };
 
   const $ = id => document.getElementById(id);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -957,20 +1260,96 @@ HTML_UI = r"""<!DOCTYPE html>
     return map[s] || s || '—';
   }
 
+  // Stati che rappresentano un esito di accettazione già registrato e concluso.
+  // Non includiamo "FirmaAccettazioneSuccessiva": può essere ancora uno stato di passaggio.
+  function isFinalizedAcceptanceStatus(raw) {
+    const token = String(raw || '').trim().toLowerCase().replace(/[\s_-]/g, '');
+    return [
+      'accettato',
+      'accettatointegralmente',
+      'accettatoparzialmente',
+      'respintoaccettatoparzialmente'
+    ].includes(token);
+  }
+
   function canShowAcceptance(raw) {
     const s = String(raw || '').trim();
     return ['InserimentoAccettazione', 'FirmaAccettazione', 'FirmaAccettazioneSuccessiva'].includes(s);
   }
 
   function setBanner(el, text, kind='') {
-    el.className = 'banner' + (kind ? ` ${kind}` : '');
+    const layoutClass = el?.id === 'signBanner' ? ' boomer-alert' : '';
+    el.className = 'banner' + (kind ? ` ${kind}` : '') + layoutClass;
     el.textContent = text;
     el.classList.remove('hidden');
   }
 
   function hideBanner(el) {
-    el.className = 'banner hidden';
+    const layoutClass = el?.id === 'signBanner' ? ' boomer-alert' : '';
+    el.className = 'banner hidden' + layoutClass;
     el.textContent = '';
+  }
+
+
+  function qrPreviewUrl(numeroFir, scale = 'thumb') {
+    if (!numeroFir) return '';
+    const params = new URLSearchParams({
+      page: String(QR_CROP.page),
+      x: String(QR_CROP.x),
+      y: String(QR_CROP.y),
+      width: String(QR_CROP.width),
+      height: String(QR_CROP.height),
+      scale,
+    });
+    return `/api/formulari/${encodeURIComponent(numeroFir)}/qr?${params.toString()}`;
+  }
+
+  function refreshQrPreview() {
+    const dock = $('qrDock');
+    const img = $('qrThumb');
+    if (!dock || !img) return;
+    if (!state.selectedNum) {
+      dock.classList.add('hidden');
+      img.removeAttribute('src');
+      return;
+    }
+    dock.classList.remove('hidden');
+    img.src = qrPreviewUrl(state.selectedNum, 'thumb');
+  }
+
+  function openQrModal() {
+    if (!state.selectedNum) return;
+    const modal = $('qrModal');
+    const img = $('qrModalImg');
+    if (!modal || !img) return;
+    img.src = qrPreviewUrl(state.selectedNum, 'large');
+    modal.classList.remove('hidden');
+  }
+
+  function closeQrModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    const modal = $('qrModal');
+    if (!modal) return;
+    modal.classList.add('hidden');
+  }
+
+  function openPdfModal() {
+    if (!state.selectedNum) return;
+    const modal = $('pdfModal');
+    const frame = $('pdfFrame');
+    if (!modal || !frame) return;
+    $('pdfModalTitle').textContent = `PDF completo · ${state.selectedNum}`;
+    frame.src = `/api/formulari/${encodeURIComponent(state.selectedNum)}/pdf#toolbar=1&navpanes=0`;
+    modal.classList.remove('hidden');
+  }
+
+  function closePdfModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    const modal = $('pdfModal');
+    const frame = $('pdfFrame');
+    if (!modal) return;
+    modal.classList.add('hidden');
+    if (frame) frame.src = 'about:blank';
   }
 
   function debugAppend(title, payload) {
@@ -1105,37 +1484,128 @@ HTML_UI = r"""<!DOCTYPE html>
     return defaultUnit ? `${raw} ${defaultUnit}` : String(raw);
   }
 
-  function setDatetimeLocalValue(el, date = new Date()) {
-    if (!el) return;
-    const pad = (n) => String(n).padStart(2, '0');
-    const local = new Date(date);
-    const value = `${local.getFullYear()}-${pad(local.getMonth() + 1)}-${pad(local.getDate())}T${pad(local.getHours())}:${pad(local.getMinutes())}`;
-    el.value = value;
+  function pad2(value) {
+    return String(value).padStart(2, '0');
+  }
+
+  function setArrivalDefaults() {
+    const now = new Date();
+    const dateInput = $('arrivalDate');
+    const timeInput = $('arrivalTime');
+    // I controlli nativi HTML date/time usano i formati ISO richiesti dal browser.
+    if (dateInput && !dateInput.value) {
+      dateInput.value = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+    }
+    if (timeInput && !timeInput.value) {
+      timeInput.value = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+    }
+  }
+
+  function resetAcceptanceForm() {
+    if ($('acceptanceType')) $('acceptanceType').value = 'A';
+    if ($('acceptedQuantity')) {
+      $('acceptedQuantity').value = '';
+      delete $('acceptedQuantity').dataset.manual;
+    }
+    if ($('arrivalDate')) {
+      $('arrivalDate').value = '';
+      delete $('arrivalDate').dataset.manual;
+    }
+    if ($('arrivalTime')) {
+      $('arrivalTime').value = '';
+      delete $('arrivalTime').dataset.manual;
+    }
+  }
+
+  function formatDigitMask(rawValue, groups, separators) {
+    const digits = String(rawValue || '').replace(/\D/g, '').slice(0, groups.reduce((a, b) => a + b, 0));
+    let output = '';
+    let offset = 0;
+    for (let i = 0; i < groups.length && offset < digits.length; i++) {
+      if (i > 0) output += separators[i - 1];
+      output += digits.slice(offset, offset + groups[i]);
+      offset += groups[i];
+    }
+    return output;
+  }
+
+  function bindDigitMask(input, groups, separators) {
+    if (!input) return;
+    input.addEventListener('input', () => {
+      const original = input.value;
+      const caret = input.selectionStart ?? original.length;
+      const digitsBeforeCaret = original.slice(0, caret).replace(/\D/g, '').length;
+      const formatted = formatDigitMask(original, groups, separators);
+      input.value = formatted;
+      let newCaret = 0;
+      let counted = 0;
+      while (newCaret < formatted.length && counted < digitsBeforeCaret) {
+        if (/\d/.test(formatted[newCaret])) counted++;
+        newCaret++;
+      }
+      input.setSelectionRange(newCaret, newCaret);
+      input.dataset.manual = '1';
+    });
+  }
+
+  function getArrivalIsoLocal() {
+    const dateText = String($('arrivalDate')?.value || '').trim();
+    const timeText = String($('arrivalTime')?.value || '').trim();
+    // type="date" restituisce YYYY-MM-DD. Manteniamo il supporto DD/MM/YYYY
+    // per eventuali browser/vecchi moduli che conservino il formato precedente.
+    let year, month, day;
+    const isoDate = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const itDate = dateText.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (isoDate) {
+      year = Number(isoDate[1]); month = Number(isoDate[2]); day = Number(isoDate[3]);
+    } else if (itDate) {
+      day = Number(itDate[1]); month = Number(itDate[2]); year = Number(itDate[3]);
+    } else {
+      return null;
+    }
+    const timeMatch = timeText.match(/^(\d{2}):(\d{2})$/);
+    if (!timeMatch) return null;
+    const hour = Number(timeMatch[1]);
+    const minute = Number(timeMatch[2]);
+    if (year < 2000 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59) return null;
+    const check = new Date(year, month - 1, day, hour, minute, 0, 0);
+    if (check.getFullYear() !== year || check.getMonth() !== month - 1 || check.getDate() !== day) return null;
+    return `${year}-${pad2(month)}-${pad2(day)}T${pad2(hour)}:${pad2(minute)}`;
   }
 
   function syncAcceptanceSection() {
-    const visible = canShowAcceptance(state.selectedStatusRaw);
+    // La scheda è disponibile solo se il FIR è in stato di accettazione e il
+    // destinatario identificato nel dettaglio coincide con il soggetto configurato.
+    // In assenza di un identificativo verificabile, la scheda resta nascosta.
+    const statusAllowsAcceptance = canShowAcceptance(state.selectedStatusRaw);
+    const recipientIsCurrentCompany = detailRecipientMatchesMyProfile(state.selectedDetail);
+    const visible = statusAllowsAcceptance && recipientIsCurrentCompany;
     state.acceptanceVisible = visible;
     const card = $('acceptanceCard');
+    const signStepNumber = $('signStepNumber');
+    if (signStepNumber) signStepNumber.textContent = visible ? '4' : '3';
     const quantityInput = $('acceptedQuantity');
     if (!card) return;
     card.classList.toggle('hidden', !visible);
     if (visible) {
-      if (!$('arrivalDateTime').value) {
-        setDatetimeLocalValue($('arrivalDateTime'));
-      }
-      const suggested = state.selectedSuggestedQuantity;
-      if (quantityInput) {
-        const existing = String(quantityInput.value || '').trim();
-        const hasManual = quantityInput.dataset.manual === '1';
-        if ((!existing || !hasManual) && suggested !== null && suggested !== undefined && suggested !== '') {
-          quantityInput.value = String(suggested);
+      const alreadySubmitted = state.acceptanceSubmittedForFir === state.selectedNum;
+      if (!alreadySubmitted) {
+        setArrivalDefaults();
+        const suggested = state.selectedSuggestedQuantity;
+        if (quantityInput) {
+          const existing = String(quantityInput.value || '').trim();
+          const hasManual = quantityInput.dataset.manual === '1';
+          if ((!existing || !hasManual) && suggested !== null && suggested !== undefined && suggested !== '') {
+            quantityInput.value = String(suggested);
+          }
+          quantityInput.placeholder = suggested !== null && suggested !== undefined && suggested !== ''
+            ? `Peso presunto: ${suggested}`
+            : 'Peso presunto';
         }
-        quantityInput.placeholder = suggested !== null && suggested !== undefined && suggested !== ''
-          ? `Peso presunto: ${suggested}`
-          : 'Peso presunto';
+        $('acceptanceStateHint').textContent = 'Questo FIR è in attesa di accettazione. Inserisci quantità, data e ora, poi invia.';
+      } else {
+        $('acceptanceStateHint').textContent = 'Accettazione registrata. I campi sono stati puliti: puoi procedere con la firma nel riquadro “Firma FIR”.';
       }
-      $('acceptanceStateHint').textContent = 'Questo FIR è in attesa di accettazione. Inserisci quantità e orario, poi invia.';
     } else {
       $('acceptanceStateHint').textContent = 'La sezione compare solo quando il FIR è in attesa di accettazione.';
     }
@@ -1251,69 +1721,68 @@ HTML_UI = r"""<!DOCTYPE html>
     };
   }
 
+  function setDetailCardValue(id, value) {
+    const element = $(id);
+    if (!element) return '';
+    const text = String(value ?? '').trim();
+    const empty = !text || text === '—' || text === '-';
+    element.textContent = empty ? '' : text;
+    const card = element.closest('.box');
+    if (card) card.classList.toggle('hidden', empty);
+    return empty ? '' : text;
+  }
+
   function renderSelectedDetail(detail) {
     const norm = normalizeDetail(detail);
+    const detailData = $('detailData');
+    if (detailData) detailData.classList.remove('hidden');
     const statusLabel = friendlyStatus(norm.status);
     const hasAcceptanceData = norm.acceptance && Object.keys(norm.acceptance).length > 0;
 
-    $('detailNum').textContent = state.selectedNum || norm.raw?.numero_fir || norm.dati_partenza?.numero_fir || '—';
-    $('detailStatus').textContent = statusLabel;
-    $('detailProd').textContent = norm.producer || '—';
-    $('detailTransport').textContent = norm.transport || '—';
-    $('detailDest').textContent = norm.recipient || '—';
-    $('detailQty').textContent = norm.quantity === '' || norm.quantity === null || norm.quantity === undefined ? '—' : String(norm.quantity);
-    $('detailEer').textContent = norm.eer || '—';
-    $('detailEmissione').textContent = fmtDate(norm.dataEmissione);
-    $('detailCreazione').textContent = fmtDate(norm.dataCreazione);
-    $('detailTrasportoInizio').textContent = fmtDate(norm.trasportoInizio);
-    $('detailAccettazione').textContent = hasAcceptanceData
-      ? `${norm.acceptanceType || '—'} · ${norm.acceptanceQty || '—'} · ${fmtDate(norm.acceptanceArrival)}`
-      : (norm.status === 'InserimentoAccettazione' ? 'Da inserire' : '—');
-    $('detailTargaMotrice').textContent = fmtValue(norm.targaMotrice);
-    $('detailTargaRimorchio').textContent = fmtValue(norm.targaRimorchio);
-    $('detailIntermediario').textContent = fmtValue(norm.intermediario);
-    $('detailAttivita').textContent = fmtValue(norm.attivita);
-    $('detailVisibilita').textContent = fmtBool(norm.visibilita);
-    $('detailCartaceo').textContent = fmtBool(norm.trasformatoCartaceo);
-    $('detailVersione').textContent = fmtValue(norm.versione);
-    $('detailBlocco').textContent = fmtValue(norm.codiceBlocco);
-    $('detailProdFull').textContent = norm.producer || '—';
-    $('detailTransportersFull').textContent = norm.transporters || '—';
-    $('detailRecipientsFull').textContent = norm.recipients || '—';
-    $('detailIntermediariesFull').textContent = norm.intermediaries || '—';
+    setDetailCardValue('detailNum', state.selectedNum || norm.raw?.numero_fir || norm.dati_partenza?.numero_fir || '');
+    setDetailCardValue('detailStatus', statusLabel);
+    setDetailCardValue('detailProd', norm.producer);
+    setDetailCardValue('detailTransport', norm.transport);
+    setDetailCardValue('detailDest', norm.recipient);
+    setDetailCardValue('detailQty', norm.quantity);
+    setDetailCardValue('detailEer', norm.eer);
+    setDetailCardValue('detailEmissione', norm.dataEmissione ? fmtDate(norm.dataEmissione) : '');
+    setDetailCardValue('detailCreazione', norm.dataCreazione ? fmtDate(norm.dataCreazione) : '');
+    setDetailCardValue('detailTrasportoInizio', norm.trasportoInizio ? fmtDate(norm.trasportoInizio) : '');
+    setDetailCardValue('detailAccettazione', hasAcceptanceData
+      ? [norm.acceptanceType, norm.acceptanceQty, norm.acceptanceArrival ? fmtDate(norm.acceptanceArrival) : ''].filter(Boolean).join(' · ')
+      : (norm.status === 'InserimentoAccettazione' ? 'Da inserire' : ''));
+    setDetailCardValue('detailTargaMotrice', fmtValue(norm.targaMotrice));
+    setDetailCardValue('detailTargaRimorchio', fmtValue(norm.targaRimorchio));
+    setDetailCardValue('detailIntermediario', fmtValue(norm.intermediario));
+    setDetailCardValue('detailAttivita', fmtValue(norm.attivita));
+    setDetailCardValue('detailVisibilita', fmtBool(norm.visibilita));
+    setDetailCardValue('detailCartaceo', fmtBool(norm.trasformatoCartaceo));
+    setDetailCardValue('detailVersione', fmtValue(norm.versione));
+    setDetailCardValue('detailBlocco', fmtValue(norm.codiceBlocco));
+    setDetailCardValue('detailProdFull', norm.producer);
+    setDetailCardValue('detailTransportersFull', norm.transporters);
+    setDetailCardValue('detailRecipientsFull', norm.recipients);
+    setDetailCardValue('detailIntermediariesFull', norm.intermediaries);
 
-    const partiesText = [
-      `Produttore: ${norm.producer || '—'}`,
-      `Trasportatore: ${norm.transport || '—'}`,
-      `Destinatario: ${norm.recipient || '—'}`,
-      `Intermediario: ${norm.intermediario || '—'}`,
-      `Rifiuto: ${norm.eer || '—'}${norm.quantity !== '' && norm.quantity !== null && norm.quantity !== undefined ? ` · ${norm.quantity}` : ''}`,
-      `Trasporto inizio: ${fmtDate(norm.trasportoInizio)}`,
-      `Targa motrice: ${fmtValue(norm.targaMotrice)}`,
-      `Targa rimorchio: ${fmtValue(norm.targaRimorchio)}`,
-      `Accettazione: ${hasAcceptanceData ? `${norm.acceptanceType || '—'} · ${norm.acceptanceQty || '—'} · ${fmtDate(norm.acceptanceArrival)}` : '—'}`,
-      `Stato: ${statusLabel}`,
-    ].join(' • ');
-
+    const narrativeRows = [
+      ['Numero FIR', state.selectedNum || norm.raw?.numero_fir || norm.dati_partenza?.numero_fir],
+      ['Stato', statusLabel],
+      ['Produttore', norm.producer],
+      ['Trasportatore', norm.transport],
+      ['Destinatario', norm.recipient],
+      ['Intermediario', norm.intermediario],
+      ['Codice EER', norm.eer],
+      ['Quantità', norm.quantity],
+      ['Data emissione', norm.dataEmissione ? fmtDate(norm.dataEmissione) : ''],
+      ['Data creazione', norm.dataCreazione ? fmtDate(norm.dataCreazione) : ''],
+      ['Inizio trasporto', norm.trasportoInizio ? fmtDate(norm.trasportoInizio) : ''],
+      ['Targa motrice', fmtValue(norm.targaMotrice)],
+      ['Targa rimorchio', fmtValue(norm.targaRimorchio)],
+      ['Accettazione', hasAcceptanceData ? [norm.acceptanceType, norm.acceptanceQty, norm.acceptanceArrival ? fmtDate(norm.acceptanceArrival) : ''].filter(Boolean).join(' · ') : ''],
+    ].filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== '' && String(value).trim() !== '—' && String(value).trim() !== '-');
     const textArea = $('detailNarrative');
-    if (textArea) {
-      textArea.textContent = [
-        `Numero FIR: ${state.selectedNum || norm.raw?.numero_fir || '—'}`,
-        `Stato: ${statusLabel}`,
-        `Produttore: ${norm.producer || '—'}`,
-        `Trasportatore: ${norm.transport || '—'}`,
-        `Destinatario: ${norm.recipient || '—'}`,
-        `Intermediario: ${norm.intermediario || '—'}`,
-        `Codice EER: ${norm.eer || '—'}`,
-        `Quantità: ${norm.quantity === '' || norm.quantity === null || norm.quantity === undefined ? '—' : norm.quantity}`,
-        `Data emissione: ${fmtDate(norm.dataEmissione)}`,
-        `Data creazione: ${fmtDate(norm.dataCreazione)}`,
-        `Inizio trasporto: ${fmtDate(norm.trasportoInizio)}`,
-        `Targa motrice: ${fmtValue(norm.targaMotrice)}`,
-        `Targa rimorchio: ${fmtValue(norm.targaRimorchio)}`,
-        `Accettazione: ${hasAcceptanceData ? `${norm.acceptanceType || '—'} · ${norm.acceptanceQty || '—'} · ${fmtDate(norm.acceptanceArrival)}` : '—'}`,
-      ].join('\n');
-    }
+    if (textArea) textArea.textContent = narrativeRows.map(([label, value]) => `${label}: ${value}`).join('\n');
 
     $('detailBanner').textContent = state.selectedNum
       ? `FIR selezionato: ${state.selectedNum} · Stato: ${statusLabel}`
@@ -1324,15 +1793,22 @@ HTML_UI = r"""<!DOCTYPE html>
     state.selectedSuggestedQuantity = norm.quantity;
     const roleHint = $('roleHint');
     if (roleHint) {
-      roleHint.textContent = state.selectedNum
-        ? 'La firma si adatta automaticamente al ruolo previsto dal FIR.'
-        : 'Seleziona un FIR per firmare.';
+      const recipientStage = isRecipientActionStage(state.selectedStatusRaw);
+      const currentCompanyIsRecipient = detailRecipientMatchesMyProfile(norm.raw);
+      roleHint.textContent = !state.selectedNum
+        ? 'Seleziona un formulario per iniziare.'
+        : (recipientStage && !currentCompanyIsRecipient)
+          ? 'Questo passaggio spetta al destinatario indicato nel formulario. Non devi inserire dati né firmare.'
+          : (state.selectedStatusRaw === 'InserimentoAccettazione' && state.acceptanceSubmittedForFir !== state.selectedNum)
+            ? 'Prima completa l’accettazione nella scheda a sinistra. Il pulsante di firma si attiverà dopo.'
+            : 'Controlla il nominativo del certificato: la firma verrà applicata al ruolo previsto dal formulario.';
     }
     const acceptanceBanner = $('acceptanceStateHint');
     if (acceptanceBanner && canShowAcceptance(norm.status)) {
       acceptanceBanner.textContent = `Accettazione disponibile per questo FIR. Peso presunto proposto: ${norm.quantity !== '' && norm.quantity !== null && norm.quantity !== undefined ? norm.quantity : 'n/d'}.`;
     }
     syncAcceptanceSection();
+    refreshQrPreview();
     updateActionButtons();
   }
 
@@ -1346,19 +1822,54 @@ HTML_UI = r"""<!DOCTYPE html>
   }
 
   function friendlyErrorMessage(err) {
-    const raw = err?.raw;
-    const title = err?.message || 'Operazione non riuscita';
-    const serverText = JSON.stringify(raw?.detail || {}).toLowerCase();
-    if (serverText.includes('chiavetta') || serverText.includes('certificato') || serverText.includes('loadinfo is not defined')) {
-      return 'Chiavetta non inserita o certificato non disponibile.';
+    const raw = err?.raw || {};
+    const detail = raw?.detail || {};
+    const status = Number(raw?.http_status || 0);
+    const detailText = JSON.stringify(detail || {}).toLowerCase();
+    const backendText = detail?.validation_error || detail?.error || detail?.hint
+      || detail?.problem_details?.response?.detail || detail?.problem_details?.response?.title || '';
+    const title = String(backendText || err?.message || 'Operazione non riuscita').trim();
+
+    if (/failed to fetch|networkerror|load failed|fetch failed/i.test(String(err?.message || ''))) {
+      return 'Non riesco a collegarmi al servizio. Controlla che il computer sia connesso a Internet e riprova. Se il problema continua, avvisa l’amministratore.';
     }
-    if (serverText.includes('non risulta firmato') || serverText.includes('not signed')) {
-      return 'Non è possibile annullare: il FIR non risulta firmato oppure la firma è già stata annullata.';
+    if (detailText.includes('chiavetta') || detailText.includes('certificato') || detailText.includes('pkcs') || detailText.includes('loadinfo is not defined')) {
+      return 'Non riesco a leggere il certificato di firma. Controlla che la chiavetta USB sia inserita, premi “RILEVA CHIAVETTA” e seleziona il nominativo corretto. Se non compare, prova un’altra porta USB e avvisa l’amministratore.';
     }
-    if (raw?.detail?.problem_details?.response?.model_state) {
-      return `${title}. Apri Debug tecnico per vedere i campi rifiutati.`;
+    if (detailText.includes('non risulta firmato') || detailText.includes('not signed')) {
+      return 'Non è possibile annullare la firma: il formulario non risulta firmato oppure la firma è già stata annullata. Non occorre ripetere l’operazione.';
     }
-    return title;
+    if (detail?.problem_details?.response?.model_state) {
+      return 'RENTRI ha rifiutato alcuni dati del formulario. Non ripetere subito l’operazione: controlla i dati inseriti e chiedi all’amministratore di verificare i dettagli tecnici.';
+    }
+    if (status === 400) {
+      return `RENTRI non ha accettato la richiesta perché alcuni dati non sono validi. ${title} Controlla il formulario e, se non capisci quale dato manca, chiedi all’amministratore.`;
+    }
+    if (status === 401) {
+      return 'La sessione di collegamento a RENTRI non è stata autorizzata. Non è un errore da correggere inserendo di nuovo i dati del formulario: avvisa l’amministratore.';
+    }
+    if (status === 403) {
+      return 'RENTRI non autorizza questa operazione per il formulario selezionato. Potrebbe non essere di competenza della nostra azienda oppure lo stato del FIR potrebbe non permetterla. Non ripetere l’operazione; chiedi una verifica.';
+    }
+    if (status === 404) {
+      return 'Il formulario o il documento richiesto non è disponibile su RENTRI. Aggiorna l’elenco e verifica di aver selezionato il FIR corretto.';
+    }
+    if (status === 409 || status === 423) {
+      return 'Il formulario è momentaneamente bloccato oppure è già in lavorazione. Aggiorna i dati e verifica lo stato prima di riprovare.';
+    }
+    if (status === 429) {
+      return 'RENTRI sta ricevendo troppe richieste. Attendi qualche minuto, poi aggiorna l’elenco. Evita di premere più volte lo stesso pulsante.';
+    }
+    if (status === 503 || status === 502 || status === 504) {
+      return 'Il servizio RENTRI non è momentaneamente disponibile. Attendi qualche minuto e riprova. L’operazione potrebbe non essere stata completata: controlla lo stato del FIR prima di inviarla di nuovo.';
+    }
+    if (status >= 500) {
+      return 'Si è verificato un problema tecnico durante il collegamento a RENTRI. Non ripetere subito un’accettazione o una firma: aggiorna prima il FIR e verifica se l’operazione è già stata registrata. Se il problema continua, avvisa l’amministratore.';
+    }
+    if (title && title !== 'Operazione non riuscita') {
+      return `${title}. Se non sai come procedere, non ripetere l’operazione e avvisa l’amministratore.`;
+    }
+    return 'L’operazione non è riuscita. Non ripeterla più volte: aggiorna prima il formulario e verifica che non sia già stata completata. Se il problema continua, avvisa l’amministratore.';
   }
 
 
@@ -1378,10 +1889,21 @@ HTML_UI = r"""<!DOCTYPE html>
     try {
       const info = await requestJson('/api/info');
       const env = String(info.env || 'demo').toUpperCase();
-      if ($('envBadge')) $('envBadge').textContent = env;
-      if ($('modePill')) $('modePill').textContent = env;
+      const isProd = env === 'PROD';
+      if ($('envBadge')) {
+        $('envBadge').textContent = env;
+        $('envBadge').style.background = isProd ? '#b91c1c' : '';
+        $('envBadge').style.color = isProd ? '#fff' : '';
+      }
+      if ($('modePill')) {
+        $('modePill').textContent = env;
+        $('modePill').style.background = isProd ? '#b91c1c' : '';
+        $('modePill').style.color = isProd ? '#fff' : '';
+      }
       if ($('subtitle')) {
-        const parts = ['Versione DEMO', 'firma USB'];
+        // Mai piu' "Versione DEMO" fisso: deve riflettere l'ambiente reale, altrimenti si rischia
+        // di firmare un FIR vero credendo di essere ancora in prova.
+        const parts = [isProd ? 'PRODUZIONE — i FIR hanno valore legale' : 'Versione DEMO', 'firma USB'];
         if (info.num_iscr_sito) parts.push(info.num_iscr_sito);
         $('subtitle').textContent = parts.join(' · ');
       }
@@ -1391,6 +1913,7 @@ HTML_UI = r"""<!DOCTYPE html>
       if (info.init_error) {
         showFriendlyMainMessage('Attenzione: una parte della configurazione iniziale non è pronta. Apri Debug tecnico per i dettagli.', 'warn');
       }
+      state.runtimeInfo = info;
       debugAppend('Configurazione caricata', {
         env: info.env,
         num_iscr_sito: info.num_iscr_sito,
@@ -1412,28 +1935,337 @@ HTML_UI = r"""<!DOCTYPE html>
   function updateActionButtons() {
     $('reloadDetailBtn').disabled = !state.selectedNum;
     $('rollbackBtn').disabled = !state.selectedNum;
-    $('usbSignBtn').disabled = !(state.selectedNum && state.usbSelected && state.usbSelected.suitable_for_signature && !state.usbSigningInProgress);
+
+    const hiddenToggle = $('toggleHiddenFirBtn');
+    if (hiddenToggle) {
+      const isHidden = state.hiddenFirEntries.some(item => item.numero_fir === state.selectedNum);
+      hiddenToggle.disabled = !state.selectedNum;
+      hiddenToggle.textContent = isHidden ? 'Ripristina formulario' : 'Nascondi formulario';
+      hiddenToggle.title = isHidden
+        ? 'Rende di nuovo visibile questo formulario nelle liste normali.'
+        : 'Nasconde questo formulario solo in questo programma; non modifica RENTRI.';
+    }
+
+    const detailReady = Boolean(state.selectedNum && state.selectedDetail);
+    const finalizedAcceptance = detailReady && isFinalizedAcceptanceStatus(state.selectedStatusRaw);
+    const recipientStage = detailReady && isRecipientActionStage(state.selectedStatusRaw);
+    const recipientIsCurrentCompany = detailReady && detailRecipientMatchesMyProfile(state.selectedDetail);
+    // Se il passaggio appartiene al destinatario e non abbiamo verificato che
+    // Truccolo Angelo sia quel destinatario, blocchiamo sia accettazione sia firma.
+    const waitingForRecipient = Boolean(recipientStage && !recipientIsCurrentCompany && !finalizedAcceptance);
+    const signCard = $('signCard');
+    const closedCard = $('closedFirCard');
+    const waitingCard = $('recipientWaitingCard');
+
+    if (signCard) signCard.classList.toggle('hidden', !detailReady || finalizedAcceptance || waitingForRecipient);
+    if (waitingCard) waitingCard.classList.toggle('hidden', !waitingForRecipient);
+    if (waitingForRecipient) {
+      const norm = normalizeDetail(state.selectedDetail);
+      const recipientName = norm.recipient || 'il destinatario riportato nel formulario';
+      $('recipientWaitingText').textContent = `Il destinatario indicato è ${recipientName}. L'accettazione e la firma di questo passaggio competono a quel destinatario, non a Truccolo Angelo.`;
+    }
+
+    if (closedCard) {
+      closedCard.classList.toggle('hidden', !finalizedAcceptance);
+      if (finalizedAcceptance) {
+        const partial = String(state.selectedStatusRaw || '').toLowerCase().includes('parzial');
+        $('closedFirTitle').textContent = partial ? 'Accettazione parziale già registrata' : 'Formulario già accettato';
+        $('closedFirText').textContent = partial
+          ? 'L’esito di accettazione parziale risulta già registrato su RENTRI. Non occorre ripetere l’operazione né apporre un’altra firma da questa schermata.'
+          : 'L’accettazione risulta già registrata su RENTRI. Il formulario è concluso: non occorre apporre un’altra firma da questa schermata.';
+      }
+    }
+
+    const acceptanceStillRequired = state.selectedStatusRaw === 'InserimentoAccettazione'
+      && state.acceptanceSubmittedForFir !== state.selectedNum;
+    $('usbSignBtn').disabled = !(detailReady && !finalizedAcceptance && !waitingForRecipient && state.usbSelected && state.usbSelected.suitable_for_signature && !state.usbSigningInProgress && !acceptanceStillRequired);
+    $('usbSignBtn').title = finalizedAcceptance
+      ? 'Questo formulario risulta già accettato e concluso.'
+      : waitingForRecipient
+        ? 'L’accettazione e la firma spettano al destinatario indicato nel formulario.'
+        : acceptanceStillRequired
+          ? 'Prima registra l’accettazione nella scheda dedicata.'
+          : 'Firma il formulario selezionato.';
     const acceptanceBtn = $('acceptanceBtn');
     if (acceptanceBtn) {
-      acceptanceBtn.disabled = !(state.selectedNum && state.acceptanceVisible);
+      acceptanceBtn.disabled = !(state.selectedNum && state.acceptanceVisible && !waitingForRecipient);
     }
   }
 
-  function updatePageControls(rowsCount, paging) {
-    const pageSize = Number($('pageSizeSelect')?.value || state.pageSize || 5);
-    const hasPrev = Number(state.currentPage) > 1;
-    const hasNext = rowsCount >= pageSize;
-    $('prevBtn').disabled = !hasPrev;
-    $('nextBtn').disabled = !hasNext;
-    $('pagingInfo').textContent = `Pagina ${state.currentPage} · ${rowsCount} risultati · ${pageSize} per pagina`;
+  function acceptanceRecipientMatchesMyProfile(item) {
+    // Regola di sicurezza: nel filtro "Da accettare" mostriamo soltanto i FIR
+    // per i quali l'identificativo del destinatario coincide con il soggetto/UL
+    // configurato. Non cercare "identificativo_soggetto" in tutto il FIR:
+    // potrebbe appartenere al produttore o al trasportatore.
+    return detailRecipientMatchesMyProfile(item);
+  }
+
+  function normalizeIdentityToken(value) {
+    let token = String(value ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (token.startsWith('IT') && token.length > 11) token = token.slice(2);
+    return token;
+  }
+
+  function collectRecipientIdentityValues(root, results = [], depth = 0) {
+    if (root === null || root === undefined || depth > 8) return results;
+    if (Array.isArray(root)) {
+      for (const item of root) collectRecipientIdentityValues(item, results, depth + 1);
+      return results;
+    }
+    if (typeof root !== 'object') return results;
+
+    const identityKeys = new Set([
+      'codice_fiscale', 'codicefiscale', 'codice_fiscale_soggetto', 'codicefiscalesoggetto',
+      'codice_fiscale_destinatario', 'codicefiscaledestinatario', 'cf',
+      'partita_iva', 'partitaiva', 'piva',
+      'partita_iva_destinatario', 'partitaivadestinatario', 'piva_destinatario', 'pivadestinatario',
+      'identificativo_soggetto', 'identificativosoggetto', 'identificativo',
+      'identificativo_soggetto_destinatario', 'identificativosoggettodestinatario',
+      'num_iscr_sito', 'numiscrsito', 'num_iscr_sito_destinatario', 'numiscrsitodestinatario',
+      'numero_iscrizione', 'numeroiscrizione'
+    ]);
+    for (const [key, value] of Object.entries(root)) {
+      if (identityKeys.has(key.toLowerCase())) {
+        if (Array.isArray(value)) {
+          for (const item of value) if (item !== null && item !== undefined) results.push(item);
+        } else if (value !== null && value !== undefined && typeof value !== 'object') {
+          results.push(value);
+        }
+      }
+      if (value && typeof value === 'object') collectRecipientIdentityValues(value, results, depth + 1);
+    }
+    return results;
+  }
+
+  function isRecipientActionStage(raw) {
+    const token = String(raw || '').trim().toLowerCase().replace(/[\s_-]/g, '');
+    // In questi stati l'azione è del destinatario: non basta essere un altro
+    // soggetto coinvolto nel FIR (ad esempio il produttore o il trasportatore).
+    return [
+      'inserimentoaccettazione',
+      'firmaaccettazione',
+      'firmaaccettazionesuccessiva',
+      'firmadestinatario'
+    ].includes(token);
+  }
+
+  function detailRecipientMatchesMyProfile(item) {
+    const info = state.runtimeInfo || {};
+    const subject = normalizeIdentityToken(
+      info.identificativo
+      || readStorage(STORAGE.identificativoSoggetto, '')
+      || $('identificativoSoggetto')?.value?.trim?.() || ''
+    );
+    const site = normalizeIdentityToken(
+      info.num_iscr_sito
+      || readStorage(STORAGE.numIscrSito, '')
+      || $('numIscrSito')?.value?.trim?.() || ''
+    );
+    const expected = new Set([subject, site].filter(Boolean));
+    if (!expected.size || !item) return false;
+
+    const d = item?.data ?? item?.result ?? item?.risultato ?? item ?? {};
+    const pf = d.dati_partenza ?? d.datiPartenza ?? d.partenza ?? {};
+    const recipientContainers = [
+      pf.destinatario, d.destinatario, d.recipient,
+      pf.destinatari, d.destinatari, d.recipients
+    ].filter(value => value !== null && value !== undefined && value !== '');
+    const values = [];
+    for (const container of recipientContainers) collectRecipientIdentityValues(container, values);
+
+    const explicitRecipientKeys = [
+      'codice_fiscale_destinatario', 'codiceFiscaleDestinatario',
+      'codice_fiscale_soggetto_destinatario', 'codiceFiscaleSoggettoDestinatario',
+      'partita_iva_destinatario', 'partitaIvaDestinatario', 'piva_destinatario', 'pivaDestinatario',
+      'identificativo_soggetto_destinatario', 'identificativoSoggettoDestinatario',
+      'num_iscr_sito_destinatario', 'numIscrSitoDestinatario'
+    ];
+    for (const key of explicitRecipientKeys) {
+      if (d[key] !== null && d[key] !== undefined && d[key] !== '') values.push(d[key]);
+      if (pf[key] !== null && pf[key] !== undefined && pf[key] !== '') values.push(pf[key]);
+    }
+    return values.some(value => expected.has(normalizeIdentityToken(value)));
+  }
+
+  function shouldShowRowForCurrentView(item) {
+    if ($('searchVista').value !== 'ACCETTAZIONE') return true;
+    return acceptanceRecipientMatchesMyProfile(item);
+  }
+
+  function updatePageControls(rowsCount, paging = {}) {
+    const page = Number(paging['Paging-Page'] || paging.page || state.currentPage || 1);
+    const pageSize = Number(paging['Paging-PageSize'] || paging.page_size || state.pageSize || 5);
+    const prevBtn = $('prevBtn');
+    const nextBtn = $('nextBtn');
+    const pagingInfo = $('pagingInfo');
+
+    if (pagingInfo) {
+      pagingInfo.textContent = `Pagina ${page}`;
+    }
+    if (prevBtn) {
+      prevBtn.disabled = page <= 1;
+    }
+    if (nextBtn) {
+      nextBtn.disabled = rowsCount < pageSize;
+    }
+  }
+
+  function hiddenFirSet() {
+    return new Set(state.hiddenFirEntries.map(item => String(item.numero_fir || '').trim()).filter(Boolean));
+  }
+
+  function makeHiddenFirSnapshot(item) {
+    const numero = String(item?.numero_fir ?? item?.numeroFir ?? state.selectedNum ?? '').trim();
+    return {
+      numero_fir: numero,
+      produttore_display: extractParty(item, ['produttore', 'produttore_denominazione', 'denominazione_produttore', 'ragione_sociale_produttore']) || '-',
+      trasportatore_display: extractPartyList(item, ['trasportatore', 'trasportatore_denominazione', 'denominazione_trasportatore', 'ragione_sociale_trasportatore', 'trasportatori']) || '-',
+      destinatario_display: extractPartyList(item, ['destinatario', 'destinatario_denominazione', 'denominazione_destinatario', 'ragione_sociale_destinatario', 'destinatari']) || '-',
+      codice_eer: String(item?.codice_eer ?? item?.eer ?? item?.codiceCER ?? ''),
+      quantita_display: formatQuantity(item?.quantita, item?.unita_misura) || '-',
+      stato: String(item?.stato ?? item?.status ?? item?.state ?? ''),
+      nascosto_il: new Date().toISOString(),
+    };
+  }
+
+  function renderFirRows(rows) {
+    const tbody = $('tbody');
+    if (!rows.length) {
+      const isHiddenView = $('searchVisibility')?.value === 'NASCOSTI';
+      const emptyMessage = isHiddenView
+        ? 'Non hai ancora nascosto formulari. Per archiviarne uno, selezionalo e premi “Nascondi formulario”.'
+        : $('searchVista').value === 'ACCETTAZIONE'
+          ? 'Nessun formulario in attesa di accettazione intestato a Truccolo Angelo. I formulari con altri destinatari vengono esclusi.'
+          : $('searchVista').value === 'FIRMA'
+            ? 'Nessun formulario in attesa di firma.'
+            : 'Nessun formulario trovato con questi filtri.';
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">${esc(emptyMessage)}</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = rows.map((item, index) => {
+      const producer = item.produttore_display || extractParty(item, ['produttore', 'produttore_denominazione', 'denominazione_produttore', 'ragione_sociale_produttore']) || '-';
+      const transport = item.trasportatore_display || extractPartyList(item, ['trasportatore', 'trasportatore_denominazione', 'denominazione_trasportatore', 'ragione_sociale_trasportatore', 'trasportatori']) || '-';
+      const recipient = item.destinatario_display || extractPartyList(item, ['destinatario', 'destinatario_denominazione', 'denominazione_destinatario', 'ragione_sociale_destinatario', 'destinatari']) || '-';
+      const qty = item.quantita_display || formatQuantity(item.quantita, item.unita_misura) || '-';
+      const status = friendlyStatus(item.stato || item.status || item.state);
+      const number = String(item.numero_fir || item.numeroFir || '').trim();
+      return `<tr data-index="${index}" class="${number === state.selectedNum ? 'selected' : ''}">
+        <td><b>${esc(number || '-')}</b></td>
+        <td>${esc(producer)}</td>
+        <td>${esc(transport)}</td>
+        <td>${esc(recipient)}</td>
+        <td>${esc(item.codice_eer || item.eer || item.codiceCER || '-')}</td>
+        <td>${esc(qty)}</td>
+        <td>${esc(status)}</td>
+      </tr>`;
+    }).join('');
+    tbody.querySelectorAll('tr[data-index]').forEach(row => {
+      row.addEventListener('click', () => selectFir(state.rows[Number(row.dataset.index)].numero_fir));
+    });
+  }
+
+  async function loadHiddenFirConfig() {
+    const config = await requestJson('/api/ui/hidden-firs');
+    state.hiddenFirEntries = Array.isArray(config?.items) ? config.items : [];
+    state.hiddenFirConfigLoaded = true;
+    updateActionButtons();
+  }
+
+  async function saveHiddenFirConfig(items) {
+    const result = await requestJson('/api/ui/hidden-firs', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({items}),
+    });
+    state.hiddenFirEntries = Array.isArray(result?.items) ? result.items : items;
+    state.hiddenFirConfigLoaded = true;
+    updateActionButtons();
+  }
+
+  function clearSelectedFirView(message = 'Formulario archiviato in locale. Per ritrovarlo apri “Altri filtri” e scegli “Formulari nascosti (archivio)”.') {
+    state.selectedNum = null;
+    state.selectedRow = null;
+    state.selectedDetail = null;
+    state.selectedStatusRaw = '';
+    state.selectedStatusLabel = '';
+    state.acceptanceSubmittedForFir = '';
+    $('detailData')?.classList.add('hidden');
+    if ($('detailBanner')) $('detailBanner').textContent = message;
+    $('qrDock')?.classList.add('hidden');
+    $('qrThumb')?.removeAttribute('src');
+    resetAcceptanceForm();
+    clearUsbHashCache();
+    syncAcceptanceSection();
+    updateActionButtons();
+  }
+
+  async function toggleHiddenSelectedFir() {
+    const numero = String(state.selectedNum || '').trim();
+    if (!numero) return;
+    const current = state.hiddenFirEntries;
+    const alreadyHidden = current.some(item => item.numero_fir === numero);
+    let nextItems;
+
+    if (alreadyHidden) {
+      nextItems = current.filter(item => item.numero_fir !== numero);
+    } else {
+      const source = state.selectedRow || state.selectedDetail || {numero_fir: numero};
+      const snapshot = makeHiddenFirSnapshot(source);
+      snapshot.numero_fir = numero;
+      nextItems = [snapshot, ...current.filter(item => item.numero_fir !== numero)];
+    }
+
+    const action = alreadyHidden ? 'ripristinare' : 'nascondere';
+    if (!confirm(`Vuoi ${action} il formulario ${numero}?\n\nQuesta scelta riguarda solo la visualizzazione di questo programma. Non modifica né cancella il formulario su RENTRI.`)) return;
+
+    const previousItems = current;
+    try {
+      await saveHiddenFirConfig(nextItems);
+      clearSelectedFirView(alreadyHidden
+        ? 'Formulario ripristinato. Tornerà visibile nelle liste normali.'
+        : 'Formulario nascosto in locale. Puoi ritrovarlo in “Altri filtri” → “Formulari nascosti (archivio)”.');
+      await loadList(1);
+      showFriendlyMainMessage(alreadyHidden
+        ? `Formulario ${numero} ripristinato nelle liste normali.`
+        : `Formulario ${numero} nascosto. È stato salvato sul computer e potrai ripristinarlo quando vuoi.`, 'ok');
+    } catch (err) {
+      state.hiddenFirEntries = previousItems;
+      updateActionButtons();
+      showFriendlyMainMessage(friendlyErrorMessage(err), 'err');
+      debugAppend('Errore salvataggio archivio formulari nascosti', err.raw || err.message);
+    }
   }
 
   async function loadList(page = 1) {
     $('searchBtn').disabled = true;
     try {
+      if (!state.hiddenFirConfigLoaded) {
+        await loadHiddenFirConfig();
+      }
       saveConfigInputs();
       const pageSize = Number($('pageSizeSelect').value || state.pageSize || 5);
       state.pageSize = pageSize;
+      const number = $('searchNumeroFir').value.trim().toUpperCase();
+      const eer = $('searchEer').value.trim().toUpperCase();
+      const hiddenView = $('searchVisibility')?.value === 'NASCOSTI';
+      $('searchVista').disabled = hiddenView;
+
+      if (hiddenView) {
+        let archived = [...state.hiddenFirEntries];
+        if (number) archived = archived.filter(item => String(item.numero_fir || '').toUpperCase().includes(number));
+        if (eer) archived = archived.filter(item => String(item.codice_eer || '').toUpperCase().includes(eer));
+        state.currentPage = 1;
+        state.rows = archived;
+        renderFirRows(state.rows);
+        $('pagingInfo').textContent = `Archivio locale · ${archived.length} formulari`;
+        $('prevBtn').disabled = true;
+        $('nextBtn').disabled = true;
+        debugAppend('Archivio locale formulari nascosti caricato', {count: archived.length});
+        return;
+      }
+
+      $('searchVista').disabled = false;
       const params = new URLSearchParams({
         filtro_tipo: 'sito',
         stato: searchStateToBackend($('searchVista').value) || 'TUTTI',
@@ -1442,43 +2274,26 @@ HTML_UI = r"""<!DOCTYPE html>
       });
       const site = $('numIscrSito').value.trim();
       const subject = $('identificativoSoggetto').value.trim();
-      const number = $('searchNumeroFir').value.trim();
-      const eer = $('searchEer').value.trim();
+      const apiNumber = $('searchNumeroFir').value.trim();
+      const apiEer = $('searchEer').value.trim();
       if (site) params.set('num_iscr_sito', site);
       if (subject) params.set('identificativo_soggetto', subject);
-      if (number) params.set('numero_fir', number);
-      if (eer) params.set('codice_eer', eer);
+      if (apiNumber) params.set('numero_fir', apiNumber);
+      if (apiEer) params.set('codice_eer', apiEer);
 
       const result = await requestJson('/api/formulari?' + params.toString());
       const rows = Array.isArray(result.data) ? result.data : [];
-      state.currentPage = page;
-      state.rows = rows.map(item => unwrapRecord(item) || {});
-      const tbody = $('tbody');
-      if (!state.rows.length) {
-        tbody.innerHTML = '<tr><td colspan="7" class="muted">Nessun formulario trovato.</td></tr>';
-      } else {
-        tbody.innerHTML = state.rows.map((item, index) => {
-          const producer = extractParty(item, ['produttore', 'produttore_denominazione', 'denominazione_produttore', 'ragione_sociale_produttore']) || '-';
-          const transport = extractPartyList(item, ['trasportatore', 'trasportatore_denominazione', 'denominazione_trasportatore', 'ragione_sociale_trasportatore', 'trasportatori']) || '-';
-          const recipient = extractPartyList(item, ['destinatario', 'destinatario_denominazione', 'denominazione_destinatario', 'ragione_sociale_destinatario', 'destinatari']) || '-';
-          const qty = formatQuantity(item.quantita, item.unita_misura) || '-';
-          const status = friendlyStatus(item.stato || item.status || item.state);
-          return `<tr data-index="${index}" class="${item.numero_fir === state.selectedNum ? 'selected' : ''}">
-            <td><b>${esc(item.numero_fir || '-')}</b></td>
-            <td>${esc(producer)}</td>
-            <td>${esc(transport)}</td>
-            <td>${esc(recipient)}</td>
-            <td>${esc(item.codice_eer || '-')}</td>
-            <td>${esc(qty)}</td>
-            <td>${esc(status)}</td>
-          </tr>`;
-        }).join('');
-        tbody.querySelectorAll('tr[data-index]').forEach(row => {
-          row.addEventListener('click', () => selectFir(state.rows[Number(row.dataset.index)].numero_fir));
-        });
+      const normalizedRows = rows.map(item => unwrapRecord(item) || {});
+      const hiddenNumbers = hiddenFirSet();
+      let visibleRows = normalizedRows.filter(item => !hiddenNumbers.has(String(item.numero_fir || item.numeroFir || '').trim()));
+      if ($('searchVista').value === 'ACCETTAZIONE') {
+        visibleRows = visibleRows.filter(item => shouldShowRowForCurrentView(item));
       }
+      state.currentPage = page;
+      state.rows = visibleRows;
+      renderFirRows(state.rows);
       updatePageControls(rows.length, result.paging || {});
-      debugAppend('Lista FIR caricata', {page, count: rows.length});
+      debugAppend('Lista FIR caricata', {page, count: rows.length, visible: visibleRows.length, hiddenExcluded: rows.length - visibleRows.length});
     } catch (err) {
       showFriendlyMainMessage(friendlyErrorMessage(err), 'err');
       debugAppend('Errore elenco FIR', err.raw || err.message);
@@ -1493,8 +2308,17 @@ HTML_UI = r"""<!DOCTYPE html>
   }
 
   async function selectFir(numero) {
+    if (state.selectedNum !== numero) {
+      state.acceptanceSubmittedForFir = '';
+      resetAcceptanceForm();
+    }
     state.selectedNum = numero;
     state.selectedRow = state.rows.find(r => r.numero_fir === numero) || null;
+    // Nasconde subito la scheda del FIR precedente mentre viene caricato il nuovo dettaglio.
+    state.selectedDetail = null;
+    state.selectedStatusRaw = '';
+    syncAcceptanceSection();
+    updateActionButtons();
     clearUsbHashCache();
     Array.from($('tbody').querySelectorAll('tr[data-index]')).forEach(row => {
       row.classList.toggle('selected', state.rows[Number(row.dataset.index)]?.numero_fir === numero);
@@ -1503,6 +2327,7 @@ HTML_UI = r"""<!DOCTYPE html>
     clearFriendlyMainMessage();
     await reloadDetail();
     syncAcceptanceSection();
+    refreshQrPreview();
     updateActionButtons();
   }
 
@@ -1527,10 +2352,11 @@ HTML_UI = r"""<!DOCTYPE html>
   async function sendAcceptance() {
     if (!state.selectedNum) return;
     const tipo = $('acceptanceType').value;
-    const quantity = Number($('acceptedQuantity').value);
-    const arrival = $('arrivalDateTime').value ? new Date($('arrivalDateTime').value) : null;
-    if (!arrival || Number.isNaN(arrival.getTime())) {
-      showFriendlyMainMessage('Inserisci una data e un’ora di arrivo valide.', 'warn');
+    const quantityText = String($('acceptedQuantity').value || '').trim();
+    const quantity = quantityText === '' ? NaN : Number(quantityText);
+    const arrivalIsoLocal = getArrivalIsoLocal();
+    if (!arrivalIsoLocal) {
+      showFriendlyMainMessage('Inserisci una data valida nel formato GG/MM/AAAA e un’ora valida nel formato HH:MM.', 'warn');
       return;
     }
     if (!Number.isFinite(quantity) || quantity < 0) {
@@ -1549,8 +2375,11 @@ HTML_UI = r"""<!DOCTYPE html>
     const weightHint = state.selectedSuggestedQuantity !== null && state.selectedSuggestedQuantity !== undefined && state.selectedSuggestedQuantity !== ''
       ? `Peso presunto proposto: ${state.selectedSuggestedQuantity}`
       : '';
-    const summary = `FIR ${state.selectedNum}\nEsito: ${labels[tipo]}\nQuantità accettata: ${quantity}\nArrivo: ${$('arrivalDateTime').value}${weightHint ? `\n${weightHint}` : ''}`;
+    const arrivalDisplay = `${$('arrivalDate').value} ${$('arrivalTime').value}`;
+    const summary = `FIR ${state.selectedNum}\nEsito: ${labels[tipo]}\nQuantità accettata: ${quantity}\nArrivo: ${arrivalDisplay}${weightHint ? `\n${weightHint}` : ''}`;
     if (!confirm(`Confermi l'accettazione del formulario?\n\n${summary}`)) return;
+    const submitButton = $('acceptanceBtn');
+    if (submitButton) submitButton.disabled = true;
     try {
       const result = await requestJson(`/api/formulari/${encodeURIComponent(state.selectedNum)}/accettazione`, {
         method: 'POST',
@@ -1558,9 +2387,11 @@ HTML_UI = r"""<!DOCTYPE html>
         body: JSON.stringify({
           tipo_accettazione: tipo,
           quantita_accettata: quantity,
-          data_ora_arrivo: $('arrivalDateTime').value,
+          data_ora_arrivo: arrivalIsoLocal,
         })
       });
+      state.acceptanceSubmittedForFir = state.selectedNum;
+      resetAcceptanceForm();
       showFriendlyMainMessage('Accettazione completata con successo.', 'ok');
       debugAppend('Accettazione inviata', result);
       await reloadDetail();
@@ -1568,6 +2399,8 @@ HTML_UI = r"""<!DOCTYPE html>
     } catch (err) {
       showFriendlyMainMessage(friendlyErrorMessage(err), 'err');
       debugAppend('Errore invio accettazione', err.raw || err.message);
+    } finally {
+      if (submitButton) submitButton.disabled = false;
     }
   }
 
@@ -1615,7 +2448,7 @@ HTML_UI = r"""<!DOCTYPE html>
       debugAppend('Errore ricerca certificati', err.raw || err.message);
     } finally {
       btn.disabled = false;
-      btn.textContent = 'Rileva chiavetta';
+      btn.textContent = 'RILEVA CHIAVETTA';
     }
   }
 
@@ -1754,7 +2587,7 @@ HTML_UI = r"""<!DOCTYPE html>
       $('usbCertSummary').classList.remove('hidden');
       $('usbCertSummary').className = 'banner ok';
       $('usbCertSummary').textContent = 'Firma apposta con successo.';
-      showFriendlyMainMessage('Firma apposta con successo.', 'ok');
+      showFriendlyMainMessage('Firma apposta con successo. Il formulario è stato aggiornato: puoi selezionare il successivo.', 'ok');
       await reloadDetail();
       await loadList(state.currentPage || 1);
     } catch (err) {
@@ -1762,7 +2595,7 @@ HTML_UI = r"""<!DOCTYPE html>
       debugAppend('Errore firma USB', err.raw || err.message);
     } finally {
       state.usbSigningInProgress = false;
-      $('usbSignBtn').textContent = 'Firma FIR';
+      $('usbSignBtn').textContent = 'FIRMA IL FORMULARIO';
       updateActionButtons();
     }
   }
@@ -1794,6 +2627,7 @@ HTML_UI = r"""<!DOCTYPE html>
       if ($('pageSizeSelect')) $('pageSizeSelect').value = String(state.pageSize);
       refreshStoredConfig();
       await loadInfo();
+      await loadHiddenFirConfig();
       await loadList(1);
       const rememberedThumb = readStorage(STORAGE.usbThumbprint, '');
       if (rememberedThumb) {
@@ -1815,12 +2649,14 @@ HTML_UI = r"""<!DOCTYPE html>
       acceptedQuantityInput.dataset.manual = '1';
     });
   }
-  const arrivalInput = $('arrivalDateTime');
-  if (arrivalInput) {
-    arrivalInput.addEventListener('input', () => {
-      arrivalInput.dataset.manual = '1';
-    });
-  }
+  $('searchVisibility').addEventListener('change', () => {
+    if ($('searchVisibility').value === 'NASCOSTI') {
+      $('searchBtn').textContent = 'MOSTRA ARCHIVIO';
+    } else {
+      $('searchBtn').textContent = 'AGGIORNA ELENCO';
+    }
+    loadList(1);
+  });
   $('pageSizeSelect').addEventListener('change', () => {
     state.pageSize = Number($('pageSizeSelect').value || 5);
     writeStorage(STORAGE.pageSize, String(state.pageSize));
@@ -1840,6 +2676,43 @@ HTML_UI = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
+@app.get("/api/ui/hidden-firs")
+async def get_hidden_firs() -> Dict[str, Any]:
+    """Restituisce l'archivio locale: non legge né modifica dati su RENTRI."""
+    return {"items": _read_hidden_firs()}
+
+
+@app.put("/api/ui/hidden-firs")
+async def put_hidden_firs(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Salva l'archivio locale dei FIR nascosti in modo atomico."""
+    raw_items = payload.get("items", [])
+    if not isinstance(raw_items, list):
+        raise HTTPException(status_code=400, detail="Formato archivio non valido: l'elenco deve essere una lista.")
+    if len(raw_items) > 5000:
+        raise HTTPException(status_code=400, detail="L'archivio contiene troppi elementi.")
+
+    sanitized: List[Dict[str, Any]] = []
+    seen = set()
+    allowed_text_fields = (
+        "produttore_display", "trasportatore_display", "destinatario_display",
+        "codice_eer", "quantita_display", "stato", "nascosto_il"
+    )
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        numero = str(raw_item.get("numero_fir", "") or "").strip()
+        if not numero or numero in seen:
+            continue
+        seen.add(numero)
+        entry: Dict[str, Any] = {"numero_fir": numero[:100]}
+        for field in allowed_text_fields:
+            value = raw_item.get(field, "")
+            entry[field] = str(value or "")[:500]
+        sanitized.append(entry)
+
+    _write_hidden_firs(sanitized)
+    return {"ok": True, "count": len(sanitized), "items": sanitized}
 
 
 @app.get("/", response_class=HTMLResponse)
