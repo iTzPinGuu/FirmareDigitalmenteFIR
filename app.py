@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import io
 import base64
 import logging
@@ -18,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
 try:
     from dotenv import load_dotenv
@@ -28,6 +29,7 @@ except Exception:
 
 from rentri_client import RentriApiError, RentriClient
 from usb_signer import UsbSignerError, list_windows_signing_certificates, sign_digest_with_windows_certificate
+from qr_hub import TABLET_PC_IP, TABLET_PORT, TABLET_URL
 
 app = FastAPI(title="RENTRI — Gestione FIR digitali")
 
@@ -113,6 +115,10 @@ def _init_client() -> tuple[Optional[RentriClient], Optional[str]]:
 
 
 client, init_error = _init_client()
+
+
+class TabletPublishPayload(BaseModel):
+    numero_fir: str = Field(..., min_length=1, max_length=100)
 
 
 class AccettazionePayload(BaseModel):
@@ -221,6 +227,9 @@ async def api_info() -> Dict[str, Any]:
         "runtime": current.get_runtime_info() if current else None,
         "num_iscr_sito": _effective_num_iscr_sito(),
         "identificativo": os.getenv("RENTRI_IDENTIFICATIVO", ""),
+        # Nome dell'operatore usato come riscontro leggibile quando il riepilogo
+        # RENTRI non espone il codice fiscale nel record sintetico.
+        "ragione_sociale": (os.getenv("RENTRI_RAGIONE_SOCIALE", "").strip() or "TRUCCOLO ANGELO SRL"),
         "env": os.getenv("RENTRI_ENV", "demo"),
         "rollback_suffix": rollback_suffix,
         "ca_credentials_id": os.getenv("RENTRI_CA_CREDENTIALS_ID", "").strip(),
@@ -537,6 +546,80 @@ async def api_formulario_qr(
         ) from exc
 
 
+@app.post("/api/tablet/publish")
+async def api_tablet_publish(body: TabletPublishPayload) -> Dict[str, Any]:
+    """Estrae il QR da RENTRI e lo inoltra al PC centrale che gestisce il display."""
+    numero = body.numero_fir.strip()
+    if not numero:
+        raise HTTPException(status_code=400, detail={"validation_error": "Seleziona prima un formulario."})
+    qr_response = await api_formulario_qr(
+        numero_fir=numero, page=1, x=479, y=78, width=86, height=86, scale="large"
+    )
+    if not isinstance(qr_response, Response) or qr_response.media_type != "image/png":
+        raise HTTPException(status_code=502, detail={"tablet_error": "Non è stato possibile preparare l'immagine QR del formulario."})
+
+    publish_url = f"{TABLET_URL.rstrip('/')}/publish"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as session:
+            response = await session.post(
+                publish_url,
+                params={"numero_fir": numero},
+                content=qr_response.body,
+                headers={"Content-Type": "image/png", "Cache-Control": "no-store"},
+            )
+            response.raise_for_status()
+            remote_status = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:1000] or f"HTTP {exc.response.status_code}"
+        raise HTTPException(
+            status_code=502,
+            detail={"tablet_error": f"Il PC che ospita il display ha rifiutato l'invio: {detail}"},
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "tablet_error": (
+                    f"Non riesco a raggiungere il PC del display ({TABLET_PC_IP}:{TABLET_PORT}). "
+                    "Verifica che BOOMER sia aperto su quel PC e che la porta 8766 sia consentita nella rete privata."
+                )
+            },
+        ) from exc
+    return {
+        "ok": True,
+        "message": "QR inviato al PC che gestisce il display.",
+        **remote_status,
+    }
+
+
+@app.post("/api/tablet/clear")
+async def api_tablet_clear() -> Dict[str, Any]:
+    clear_url = f"{TABLET_URL.rstrip('/')}/clear"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as session:
+            response = await session.post(clear_url, headers={"Cache-Control": "no-store"})
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail={"tablet_error": f"Il PC del display ha rifiutato il comando di arresto: HTTP {exc.response.status_code}."}) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail={"tablet_error": f"PC del display non raggiungibile ({TABLET_PC_IP}:{TABLET_PORT})."}) from exc
+
+
+@app.get("/api/tablet/status")
+async def api_tablet_status() -> Dict[str, Any]:
+    status_url = f"{TABLET_URL.rstrip('/')}/status"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as session:
+            response = await session.get(status_url, headers={"Cache-Control": "no-store"})
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail={"tablet_error": f"Il PC del display ha risposto con HTTP {exc.response.status_code}."}) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail={"tablet_error": f"PC del display non raggiungibile ({TABLET_PC_IP}:{TABLET_PORT})."}) from exc
+
+
 @app.post("/api/formulari/{numero_fir}/accettazione")
 async def api_accettazione(numero_fir: str, body: AccettazionePayload) -> Dict[str, Any]:
     current = _require_client()
@@ -841,9 +924,9 @@ HTML_UI = r"""<!DOCTYPE html>
     .banner.warn{background:var(--warn-bg);border-color:#efd9a8;color:#6b4a13}
     .banner.err{background:var(--danger-bg);border-color:#e8b9bf;color:#842a33}
     .hidden{display:none!important}
-    .boomer-main{width:100%;height:auto;flex:1 1 0;min-height:0;max-width:1900px;margin:0 auto;padding:12px;display:grid;grid-template-columns:minmax(430px,.88fr) minmax(620px,1.32fr);gap:12px;overflow:hidden}
+    .boomer-main{width:100%;height:calc(100vh - 74px);flex:1 1 0;min-height:0;max-width:1900px;margin:0 auto;padding:12px;display:grid;grid-template-columns:minmax(430px,.88fr) minmax(620px,1.32fr);gap:12px;overflow:hidden}
     .left-column,.right-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0}
-    .right-column{overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:#b8c8bb transparent}
+    .right-column{overflow:hidden;min-height:0}
     .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:var(--shadow);min-width:0}
     .list-panel{display:flex;flex-direction:column;flex:1;min-height:0}
     .panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
@@ -905,14 +988,22 @@ HTML_UI = r"""<!DOCTYPE html>
     .detail-grid .value{font-size:12px;font-weight:700;margin-top:3px;overflow-wrap:anywhere}
     .detail-pre{white-space:pre-wrap;margin:8px 0 0;font:inherit;font-size:12px;max-height:180px;overflow:auto}
     #reloadDetailBtn{min-height:34px;padding:6px 10px;font-size:11px}
-    .qr-dock{display:flex;align-items:center;gap:10px;margin-top:9px;padding:8px 10px;border:1px solid #dfe9e1;border-radius:11px;background:#fbfdfb;width:100%;min-width:0}
+    #rollbackBtn{min-height:34px;padding:6px 10px;font-size:11px;white-space:nowrap}
+    button.danger:hover{background:#8e2630;color:#fff}
+    .qr-dock{display:grid;grid-template-columns:64px minmax(0,1fr);grid-template-areas:'thumb copy' 'actions actions' 'status status';gap:8px 10px;align-items:start;margin-top:9px;padding:8px 10px;border:1px solid #dfe9e1;border-radius:11px;background:#fbfdfb;width:100%;min-width:0}
     .qr-dock.hidden{display:none!important}
     .qr-label{font-size:11px;color:var(--muted);font-weight:850;text-transform:uppercase;letter-spacing:.05em}
-    .qr-thumb-wrap{display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto}
+    .qr-thumb-wrap{grid-area:thumb;display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto}
     .qr-thumb{width:62px;height:62px;object-fit:contain;border-radius:7px;border:1px solid #dfe8e1;background:#fff}
-    .qr-copy{flex:1;min-width:0}
+    .qr-copy{grid-area:copy;min-width:0}
     .qr-copy .small-note{font-size:11px;color:var(--muted)}
-    .qr-pdf-button{min-height:38px;padding:8px 12px;font-size:12px;white-space:nowrap}
+    .qr-actions{grid-area:actions;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+    .qr-pdf-button{min-height:38px;padding:8px 12px;font-size:12px;white-space:nowrap;flex:1 1 190px}
+    .tablet-connection{grid-area:status;font-size:11px;color:var(--muted)}
+    #sendQrTabletBtn{border-color:#b9d8c0;color:#245b31;font-weight:800}
+    #sendQrTabletBtn.danger{background:#a8323c;border-color:#922934;color:#fff}
+    #sendQrTabletBtn.danger:hover{background:#8e2630;color:#fff}
+    #sendQrTabletBtn:disabled{opacity:.5}
     .action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
     .action-grid:has(#acceptanceCard.hidden){grid-template-columns:1fr}
     #acceptanceCard,#signCard,#closedFirCard{min-width:0;padding:13px}
@@ -941,7 +1032,6 @@ HTML_UI = r"""<!DOCTYPE html>
     #usbMemoryNote,#roleHint,.small-note{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.3}
     #usbCertSummary{padding:8px 10px;font-size:12px;margin-top:6px}
     #usbSignBtn{width:100%;margin-top:10px;min-height:50px;font-size:16px}
-    #rollbackBtn{display:none!important}
     #signBanner{margin-top:8px;font-size:13px}
     .debug-tools{padding:9px 11px;font-size:12px;background:#f8faf8}
     .debug-tools h2{font-size:13px;margin:0}
@@ -993,8 +1083,8 @@ HTML_UI = r"""<!DOCTYPE html>
       <div class="filterbar">
         <input id="searchNumeroFir" placeholder="Cerca numero FIR" aria-label="Cerca per numero FIR" />
         <select id="searchVista" aria-label="Tipo di formulari da visualizzare">
-          <option value="ACCETTAZIONE" selected>Da accettare</option>
-          <option value="FIRMA">Da firmare</option>
+          <option value="ACCETTAZIONE">Da accettare</option>
+          <option value="FIRMA" selected>Da firmare</option>
           <option value="TUTTI">Tutti i formulari</option>
           <option value="ACCETTATI">Già accettati</option>
           <option value="PARZIALI">Accettati parzialmente</option>
@@ -1053,6 +1143,7 @@ HTML_UI = r"""<!DOCTYPE html>
         </div>
         <div class="toolbar" style="flex-wrap:wrap;justify-content:flex-end">
           <button class="secondary" id="toggleHiddenFirBtn" type="button" onclick="toggleHiddenSelectedFir()" disabled>Nascondi formulario</button>
+          <button class="danger" id="rollbackBtn" onclick="rollbackSignature()" disabled>ANNULLA FIRMA FIR SELEZIONATO</button>
           <button class="secondary" id="reloadDetailBtn" onclick="reloadDetail()" disabled>Aggiorna dati</button>
         </div>
       </div>
@@ -1096,7 +1187,11 @@ HTML_UI = r"""<!DOCTYPE html>
       <div class="qr-dock hidden" id="qrDock" title="Anteprima QR del formulario">
         <div class="qr-thumb-wrap" onclick="openQrModal()"><img id="qrThumb" class="qr-thumb" alt="Anteprima QR del formulario" /></div>
         <div class="qr-copy"><div class="qr-label">QR del formulario</div><div class="small-note">Clicca sul codice per ingrandirlo.</div></div>
-        <button class="secondary qr-pdf-button" id="openPdfBtn" type="button" onclick="openPdfModal()">Apri PDF completo</button>
+        <div class="qr-actions">
+          <button class="secondary qr-pdf-button" id="sendQrTabletBtn" type="button" onclick="sendQrToTablet()" disabled>Mostra sul tablet</button>
+          <button class="secondary qr-pdf-button" id="openPdfBtn" type="button" onclick="openPdfModal()">Apri PDF completo</button>
+        </div>
+        <div class="tablet-connection" id="tabletQrStatus" aria-live="polite">Tablet: verifica collegamento…</div>
       </div>
     </div>
 
@@ -1161,7 +1256,6 @@ HTML_UI = r"""<!DOCTYPE html>
         <div id="usbCertSummary" class="banner hidden"></div>
         <div class="small-note" id="roleHint">Seleziona un formulario per verificare se è pronto per la firma.</div>
         <button class="primary" id="usbSignBtn" onclick="signWithUsb()" disabled>FIRMA IL FORMULARIO</button>
-        <button class="secondary" id="rollbackBtn" onclick="rollbackSignature()" disabled>Annulla ultima firma</button>
       </div>
     </div>
 
@@ -1210,6 +1304,9 @@ HTML_UI = r"""<!DOCTYPE html>
     runtimeInfo: null,
     hiddenFirEntries: [],
     hiddenFirConfigLoaded: false,
+    tabletStatus: null,
+    tabletQrActive: false,
+    tabletQrFir: '',
   };
 
   const STORAGE = {
@@ -1304,6 +1401,95 @@ HTML_UI = r"""<!DOCTYPE html>
     return `/api/formulari/${encodeURIComponent(numeroFir)}/qr?${params.toString()}`;
   }
 
+  function updateTabletSendButton() {
+    const button = $('sendQrTabletBtn');
+    if (!button) return;
+    const active = Boolean(state.tabletQrActive);
+    button.textContent = active ? 'Smetti di inviare' : 'Mostra sul tablet';
+    button.classList.toggle('danger', active);
+    button.classList.toggle('secondary', !active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.disabled = !state.selectedNum;
+  }
+
+  async function sendQrToTablet() {
+    const numero = String(state.selectedNum || '').trim();
+    const button = $('sendQrTabletBtn');
+    if (!numero || !button) return;
+
+    // Lo stesso pulsante interrompe la visualizzazione già avviata.
+    if (state.tabletQrActive) {
+      button.disabled = true;
+      button.textContent = 'INTERROMPO…';
+      try {
+        await requestJson('/api/tablet/clear', {method: 'POST'});
+        state.tabletQrActive = false;
+        state.tabletQrFir = '';
+        await updateTabletStatus();
+        showFriendlyMainMessage('Visualizzazione del QR interrotta sul tablet del bancone.', 'ok');
+        debugAppend('Invio QR interrotto sul tablet', {numero_fir: numero});
+      } catch (err) {
+        showFriendlyMainMessage(friendlyErrorMessage(err), 'err');
+        debugAppend('Errore interruzione QR sul tablet', err.raw || err.message);
+      } finally {
+        updateTabletSendButton();
+      }
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = 'PREPARO IL QR…';
+    try {
+      const result = await requestJson('/api/tablet/publish', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({numero_fir: numero}),
+      });
+      state.tabletQrActive = true;
+      state.tabletQrFir = numero;
+      await updateTabletStatus();
+      // La pubblicazione sul servizio LAN è riuscita: lo stato di connessione
+      // può aggiornarsi con qualche secondo di ritardo, quindi non mostriamo
+      // un falso errore basato sul solo heartbeat del tablet.
+      showFriendlyMainMessage(`QR del formulario ${numero} inviato al display del bancone.`, 'ok');
+      debugAppend('QR inviato al tablet', {numero_fir: numero, tablet_url: result.url, tablet_ip: result.tablet_ip, tablet_connected: result.tablet_connected});
+    } catch (err) {
+      showFriendlyMainMessage(friendlyErrorMessage(err), 'err');
+      debugAppend('Errore invio QR al tablet', err.raw || err.message);
+    } finally {
+      updateTabletSendButton();
+    }
+  }
+
+  async function clearTabletQrSilently() {
+    // La selezione del formulario cambia: il display viene svuotato e il
+    // pulsante torna allo stato iniziale anche se la richiesta non risponde.
+    state.tabletQrActive = false;
+    state.tabletQrFir = '';
+    updateTabletSendButton();
+    try {
+      await fetch('/api/tablet/clear', {method: 'POST', cache: 'no-store'});
+      await updateTabletStatus();
+    } catch {}
+  }
+
+  async function updateTabletStatus() {
+    const label = $('tabletQrStatus');
+    if (!label) return;
+    try {
+      const info = await requestJson('/api/tablet/status');
+      state.tabletStatus = info;
+      label.textContent = info.connected
+        ? `Tablet collegato · ${info.tablet_ip}`
+        : `Tablet non collegato · ${info.tablet_ip} · apri Fully Kiosk`;
+      label.style.color = info.connected ? '#28723a' : '#9a6b22';
+      label.title = `Pagina tablet: ${info.url}`;
+    } catch {
+      label.textContent = 'Servizio tablet non disponibile';
+      label.style.color = '#a33';
+    }
+  }
+
   function refreshQrPreview() {
     const dock = $('qrDock');
     const img = $('qrThumb');
@@ -1311,9 +1497,11 @@ HTML_UI = r"""<!DOCTYPE html>
     if (!state.selectedNum) {
       dock.classList.add('hidden');
       img.removeAttribute('src');
+      img.style.display = 'none';
       return;
     }
     dock.classList.remove('hidden');
+    img.style.display = 'block';
     img.src = qrPreviewUrl(state.selectedNum, 'thumb');
   }
 
@@ -1631,7 +1819,7 @@ HTML_UI = r"""<!DOCTYPE html>
   function searchStateToBackend(value) {
     switch (value) {
       case 'ACCETTAZIONE': return 'InserimentoAccettazione';
-      case 'FIRMA': return 'FirmaAccettazione';
+      case 'FIRMA': return 'TUTTI';
       case 'ACCETTATI': return 'Accettato';
       case 'PARZIALI': return 'RespintoAccettatoParzialmente';
       default: return '';
@@ -1934,7 +2122,11 @@ HTML_UI = r"""<!DOCTYPE html>
 
   function updateActionButtons() {
     $('reloadDetailBtn').disabled = !state.selectedNum;
-    $('rollbackBtn').disabled = !state.selectedNum;
+    $('rollbackBtn').disabled = !(state.selectedNum && state.selectedDetail);
+    $('rollbackBtn').title = state.selectedDetail
+      ? 'RENTRI verifica se questa è la tua ultima firma e se sussistono ancora le condizioni per annullarla.'
+      : 'Seleziona un formulario e attendi il caricamento dei suoi dati.';
+    updateTabletSendButton();
 
     const hiddenToggle = $('toggleHiddenFirBtn');
     if (hiddenToggle) {
@@ -2049,47 +2241,250 @@ HTML_UI = r"""<!DOCTYPE html>
     ].includes(token);
   }
 
-  function detailRecipientMatchesMyProfile(item) {
+  function getCurrentCompanyIdentityTokens() {
     const info = state.runtimeInfo || {};
-    const subject = normalizeIdentityToken(
-      info.identificativo
-      || readStorage(STORAGE.identificativoSoggetto, '')
-      || $('identificativoSoggetto')?.value?.trim?.() || ''
-    );
-    const site = normalizeIdentityToken(
-      info.num_iscr_sito
-      || readStorage(STORAGE.numIscrSito, '')
-      || $('numIscrSito')?.value?.trim?.() || ''
-    );
-    const expected = new Set([subject, site].filter(Boolean));
-    if (!expected.size || !item) return false;
-
-    const d = item?.data ?? item?.result ?? item?.risultato ?? item ?? {};
-    const pf = d.dati_partenza ?? d.datiPartenza ?? d.partenza ?? {};
-    const recipientContainers = [
-      pf.destinatario, d.destinatario, d.recipient,
-      pf.destinatari, d.destinatari, d.recipients
-    ].filter(value => value !== null && value !== undefined && value !== '');
-    const values = [];
-    for (const container of recipientContainers) collectRecipientIdentityValues(container, values);
-
-    const explicitRecipientKeys = [
-      'codice_fiscale_destinatario', 'codiceFiscaleDestinatario',
-      'codice_fiscale_soggetto_destinatario', 'codiceFiscaleSoggettoDestinatario',
-      'partita_iva_destinatario', 'partitaIvaDestinatario', 'piva_destinatario', 'pivaDestinatario',
-      'identificativo_soggetto_destinatario', 'identificativoSoggettoDestinatario',
-      'num_iscr_sito_destinatario', 'numIscrSitoDestinatario'
+    const rawValues = [
+      info.identificativo,
+      info.issuer,
+      info.num_iscr_sito,
+      readStorage(STORAGE.identificativoSoggetto, ''),
+      readStorage(STORAGE.numIscrSito, ''),
+      $('identificativoSoggetto')?.value?.trim?.() || '',
+      $('numIscrSito')?.value?.trim?.() || '',
     ];
-    for (const key of explicitRecipientKeys) {
-      if (d[key] !== null && d[key] !== undefined && d[key] !== '') values.push(d[key]);
-      if (pf[key] !== null && pf[key] !== undefined && pf[key] !== '') values.push(pf[key]);
+    return new Set(rawValues.map(normalizeIdentityToken).filter(Boolean));
+  }
+
+  function normalizeCompanyName(value) {
+    return String(value ?? '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+  }
+
+  function getCurrentCompanyNameTokens() {
+    const info = state.runtimeInfo || {};
+    const client = info.client || {};
+    const values = [
+      info.ragione_sociale,
+      info.denominazione,
+      info.company_name,
+    ];
+
+    // Il certificato P12 può riportare la denominazione in CN oppure O.
+    // Non confrontiamo il DN intero: estraiamo soltanto i valori leggibili.
+    for (const dn of [client.subject, client.issuer_cert]) {
+      const source = String(dn || '');
+      const re = /(?:^|,\s*)(CN|O|OU)=((?:\\.|[^,])*)/gi;
+      let match;
+      while ((match = re.exec(source)) !== null) {
+        values.push(match[2].replace(/\\,/g, ',').trim());
+      }
     }
-    return values.some(value => expected.has(normalizeIdentityToken(value)));
+
+    return new Set(values.map(normalizeCompanyName).filter(value => value.length >= 5));
+  }
+
+  function collectPartyMatchValues(root, identities = [], names = [], depth = 0) {
+    if (root === null || root === undefined || depth > 10) return { identities, names };
+    if (Array.isArray(root)) {
+      for (const item of root) collectPartyMatchValues(item, identities, names, depth + 1);
+      return { identities, names };
+    }
+    if (typeof root === 'string' || typeof root === 'number') {
+      const value = String(root).trim();
+      if (value) names.push(value);
+      return { identities, names };
+    }
+    if (typeof root !== 'object') return { identities, names };
+
+    const identityKeys = new Set([
+      'codicefiscale', 'codicefiscalesoggetto', 'codicefiscaleoperatore', 'cf',
+      'partitaiva', 'piva', 'identificativo', 'identificativosoggetto',
+      'identificativooperatore', 'numiscrsito', 'numeroiscrizione', 'idsoggetto',
+      'idoperatore', 'codicefiscaleproduttore', 'codicefiscaletrasportatore',
+      'partitaivaproduttore', 'partitaivatrasportatore'
+    ]);
+    const nameKeys = new Set([
+      'denominazione', 'denominazionesoggetto', 'denominazioneoperatore',
+      'ragionesociale', 'nominativo', 'nomeazienda', 'companyname'
+    ]);
+
+    for (const [key, value] of Object.entries(root)) {
+      const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (identityKeys.has(normalizedKey) && value !== null && value !== undefined && typeof value !== 'object') {
+        identities.push(value);
+      }
+      if (nameKeys.has(normalizedKey) && value !== null && value !== undefined && typeof value !== 'object') {
+        names.push(value);
+      }
+      if (value && typeof value === 'object') {
+        collectPartyMatchValues(value, identities, names, depth + 1);
+      }
+    }
+    return { identities, names };
+  }
+
+  function deepFindAllValues(root, wantedKeys, results = [], depth = 0) {
+    if (root === null || root === undefined || depth > 10) return results;
+    if (Array.isArray(root)) {
+      for (const item of root) deepFindAllValues(item, wantedKeys, results, depth + 1);
+      return results;
+    }
+    if (typeof root !== 'object') return results;
+    for (const [key, value] of Object.entries(root)) {
+      if (wantedKeys.includes(key) && value !== null && value !== undefined && value !== '') {
+        results.push(value);
+      }
+      if (value && typeof value === 'object') {
+        deepFindAllValues(value, wantedKeys, results, depth + 1);
+      }
+    }
+    return results;
+  }
+
+  function itemMatchesCurrentCompany(item, aliases) {
+    const expectedIds = getCurrentCompanyIdentityTokens();
+    const expectedNames = getCurrentCompanyNameTokens();
+    if ((!expectedIds.size && !expectedNames.size) || !item) return false;
+
+    const containers = aliases.flatMap(alias => deepFindAllValues(item, alias));
+    const foundIds = [];
+    const foundNames = [];
+    for (const container of containers) {
+      collectPartyMatchValues(container, foundIds, foundNames);
+      // Alcuni riepiloghi API espongono il ruolo come semplice stringa.
+      if (typeof container === 'string') foundNames.push(container);
+    }
+
+    const idMatch = foundIds.some(value => expectedIds.has(normalizeIdentityToken(value)));
+    if (idMatch) return true;
+
+    const nameMatch = foundNames.some(value => expectedNames.has(normalizeCompanyName(value)));
+    return nameMatch;
+  }
+
+  function detailRecipientMatchesMyProfile(item) {
+    return itemMatchesCurrentCompany(item, [
+      ['destinatario'], ['destinatari'], ['recipient'], ['recipients'],
+      ['destinatario_denominazione'], ['denominazione_destinatario'],
+      ['ragione_sociale_destinatario'], ['codice_fiscale_destinatario'],
+      ['codice_fiscale_soggetto_destinatario'], ['partita_iva_destinatario'],
+      ['identificativo_soggetto_destinatario'], ['num_iscr_sito_destinatario']
+    ]);
+  }
+
+  function getFirStatus(item) {
+    const value = deepFind(item, [
+      'stato_formulario', 'statoFormulario', 'stato', 'status', 'state'
+    ]);
+    if (value && typeof value === 'object') {
+      return String(value.codice ?? value.value ?? value.stato ?? value.descrizione ?? '');
+    }
+    return String(value ?? '').trim();
+  }
+
+  function isSigningStatusCandidate(raw) {
+    const token = String(raw || '').trim().toLowerCase().replace(/[\s_-]/g, '');
+    // Escludiamo intenzionalmente InserimentoAccettazione: significa "da accettare",
+    // non "da firmare". Sono ammessi solo stati che richiedono un atto di firma.
+    return [
+      'firmaproduttoretrasportatoreiniziale',
+      'firmaproduttoreiniziale',
+      'firmatrasportatoreiniziale',
+      'firmaproduttore',
+      'firmatrasportatore',
+      'firmatrasportatoresuccessivo',
+      'firmadestinatario',
+      'firmadestinatariosuccessivo',
+      'firmaaccettazione',
+      'firmaaccettazionesuccessiva'
+    ].includes(token);
+  }
+
+  function shouldShowSigningRow(item) {
+    const token = getFirStatus(item).toLowerCase().replace(/[\s_-]/g, '');
+    if (!isSigningStatusCandidate(token)) return false;
+
+    const recipientStage = [
+      'firmaaccettazione', 'firmaaccettazionesuccessiva',
+      'firmadestinatario', 'firmadestinatariosuccessivo'
+    ].includes(token);
+    if (recipientStage) return detailRecipientMatchesMyProfile(item);
+
+    // Nel nome combinato "FirmaProduttoreTrasportatoreIniziale" la seconda
+    // parola è "Trasportatore", non "FirmaTrasportatore": cercare la sequenza
+    // "firmatrasportatore" escludeva erroneamente proprio questo stato.
+    const producerStage = token.includes('produttore');
+    const transportStage = token.includes('trasportatore');
+
+    const producerMatch = producerStage && itemMatchesCurrentCompany(item, [
+      ['produttore'], ['produttori'], ['producer'],
+      ['produttore_denominazione'], ['denominazione_produttore'],
+      ['ragione_sociale_produttore'], ['codice_fiscale_produttore'],
+      ['codice_fiscale_soggetto_produttore'], ['partita_iva_produttore'],
+      ['identificativo_soggetto_produttore']
+    ]);
+    const transportMatch = transportStage && itemMatchesCurrentCompany(item, [
+      ['trasportatore'], ['trasportatori'], ['transporters'], ['transporter'],
+      ['trasportatore_denominazione'], ['denominazione_trasportatore'],
+      ['ragione_sociale_trasportatore'], ['codice_fiscale_trasportatore'],
+      ['partita_iva_trasportatore'], ['identificativo_soggetto_trasportatore']
+    ]);
+
+    // Nello stato combinato è sufficiente che Truccolo sia uno dei due firmatari.
+    return Boolean(producerMatch || transportMatch);
+  }
+
+  async function filterSigningRowsWithDetails(rows) {
+    const candidates = rows.filter(item => isSigningStatusCandidate(getFirStatus(item)));
+    if (!candidates.length) return [];
+
+    const matched = [];
+    let detailErrors = 0;
+    const concurrency = 4;
+    for (let offset = 0; offset < candidates.length; offset += concurrency) {
+      const batch = candidates.slice(offset, offset + concurrency);
+      const results = await Promise.all(batch.map(async summary => {
+        const numero = String(
+          deepFind(summary, ['numero_fir', 'numeroFir', 'numero']) || ''
+        ).trim();
+        if (!numero) return null;
+        try {
+          const detail = await requestJson(`/api/formulari/${encodeURIComponent(numero)}`);
+          const detailRecord = (detail && typeof detail === 'object')
+            ? (detail.data ?? detail.result ?? detail.risultato ?? detail)
+            : detail;
+          const merged = {
+            ...summary,
+            ...(detailRecord && typeof detailRecord === 'object' && !Array.isArray(detailRecord) ? detailRecord : {}),
+            dettaglio_completo: detail,
+          };
+          return shouldShowSigningRow(merged) ? summary : null;
+        } catch (error) {
+          detailErrors += 1;
+          debugAppend(`Dettaglio non disponibile per il filtro firma (${numero})`, error.raw || error.message);
+          // Fail closed: se non riusciamo a verificare il ruolo, non mostriamo il FIR
+          // come firmabile per errore.
+          return null;
+        }
+      }));
+      for (const result of results) if (result) matched.push(result);
+    }
+    debugAppend('Verifica filtro Da firmare', {
+      righe_ricevute: rows.length,
+      stati_di_firma: candidates.length,
+      firma_di_competenza_truccolo: matched.length,
+      errori_dettaglio: detailErrors,
+    });
+    return matched;
   }
 
   function shouldShowRowForCurrentView(item) {
-    if ($('searchVista').value !== 'ACCETTAZIONE') return true;
-    return acceptanceRecipientMatchesMyProfile(item);
+    const view = $('searchVista').value;
+    if (view === 'ACCETTAZIONE') return acceptanceRecipientMatchesMyProfile(item);
+    if (view === 'FIRMA') return shouldShowSigningRow(item);
+    return true;
   }
 
   function updatePageControls(rowsCount, paging = {}) {
@@ -2137,7 +2532,7 @@ HTML_UI = r"""<!DOCTYPE html>
         : $('searchVista').value === 'ACCETTAZIONE'
           ? 'Nessun formulario in attesa di accettazione intestato a Truccolo Angelo. I formulari con altri destinatari vengono esclusi.'
           : $('searchVista').value === 'FIRMA'
-            ? 'Nessun formulario in attesa di firma.'
+            ? 'Nessun formulario che richiede la tua firma.'
             : 'Nessun formulario trovato con questi filtri.';
       tbody.innerHTML = `<tr><td colspan="7" class="muted">${esc(emptyMessage)}</td></tr>`;
       return;
@@ -2184,6 +2579,7 @@ HTML_UI = r"""<!DOCTYPE html>
   }
 
   function clearSelectedFirView(message = 'Formulario archiviato in locale. Per ritrovarlo apri “Altri filtri” e scegli “Formulari nascosti (archivio)”.') {
+    clearTabletQrSilently();
     state.selectedNum = null;
     state.selectedRow = null;
     state.selectedDetail = null;
@@ -2285,9 +2681,15 @@ HTML_UI = r"""<!DOCTYPE html>
       const rows = Array.isArray(result.data) ? result.data : [];
       const normalizedRows = rows.map(item => unwrapRecord(item) || {});
       const hiddenNumbers = hiddenFirSet();
+      const currentView = $('searchVista').value;
       let visibleRows = normalizedRows.filter(item => !hiddenNumbers.has(String(item.numero_fir || item.numeroFir || '').trim()));
-      if ($('searchVista').value === 'ACCETTAZIONE') {
-        visibleRows = visibleRows.filter(item => shouldShowRowForCurrentView(item));
+      if (currentView === 'ACCETTAZIONE') {
+        visibleRows = visibleRows.filter(item => acceptanceRecipientMatchesMyProfile(item));
+      } else if (currentView === 'FIRMA') {
+        // Il riepilogo elenco non sempre contiene gli identificativi completi dei soggetti.
+        // Per ogni FIR in uno stato di firma recuperiamo il dettaglio ufficiale e verifichiamo
+        // produttore/trasportatore/destinatario sui dati completi.
+        visibleRows = await filterSigningRowsWithDetails(visibleRows);
       }
       state.currentPage = page;
       state.rows = visibleRows;
@@ -2309,6 +2711,8 @@ HTML_UI = r"""<!DOCTYPE html>
 
   async function selectFir(numero) {
     if (state.selectedNum !== numero) {
+      // Evita che l'autista successivo possa scansionare il QR del FIR precedente.
+      await clearTabletQrSilently();
       state.acceptanceSubmittedForFir = '';
       resetAcceptanceForm();
     }
@@ -2602,7 +3006,8 @@ HTML_UI = r"""<!DOCTYPE html>
 
   async function rollbackSignature() {
     if (!state.selectedNum) return;
-    if (!confirm(`Annullare l'ultima firma del FIR ${state.selectedNum}?`)) return;
+    const warning = `ATTENZIONE: stai richiedendo a RENTRI l'annullamento dell'ultima firma del FIR ${state.selectedNum}.\n\nIl rollback è possibile soltanto per una tua ultima firma e se RENTRI conferma che sussistono ancora le condizioni previste (ad esempio il limite temporale e l'assenza di eventi successivi). L'operazione non elimina il FIR.\n\nVuoi continuare?`;
+    if (!confirm(warning)) return;
     try {
       const result = await requestJson(`/api/formulari/${encodeURIComponent(state.selectedNum)}/rollback`, {
         method: 'POST',
@@ -2629,6 +3034,8 @@ HTML_UI = r"""<!DOCTYPE html>
       await loadInfo();
       await loadHiddenFirConfig();
       await loadList(1);
+      await updateTabletStatus();
+      window.setInterval(updateTabletStatus, 3000);
       const rememberedThumb = readStorage(STORAGE.usbThumbprint, '');
       if (rememberedThumb) {
         await loadUsbCertificates();
@@ -2641,6 +3048,10 @@ HTML_UI = r"""<!DOCTYPE html>
       debugAppend('Errore avvio', err.raw || err.message);
     }
   }
+
+  // All'avvio mostra subito i FIR che richiedono la firma di Truccolo Angelo.
+  const startupView = $('searchVista');
+  if (startupView) startupView.value = 'FIRMA';
 
   $('usbCertSelect').addEventListener('change', selectUsbCertificate);
   const acceptedQuantityInput = $('acceptedQuantity');
@@ -2721,6 +3132,11 @@ async def home() -> str:
 
 
 if __name__ == "__main__":
+    import threading
     import uvicorn
+    from qr_hub import tablet_app
 
+    tablet_config = uvicorn.Config(tablet_app, host="0.0.0.0", port=8766, reload=False, access_log=False, log_level="warning")
+    tablet_server = uvicorn.Server(tablet_config)
+    threading.Thread(target=lambda: asyncio.run(tablet_server.serve()), name="RENTRI-QR-TABLET", daemon=True).start()
     uvicorn.run("app:app", host="127.0.0.1", port=8765, reload=False)
