@@ -924,9 +924,9 @@ HTML_UI = r"""<!DOCTYPE html>
     .banner.warn{background:var(--warn-bg);border-color:#efd9a8;color:#6b4a13}
     .banner.err{background:var(--danger-bg);border-color:#e8b9bf;color:#842a33}
     .hidden{display:none!important}
-    .boomer-main{width:100%;height:calc(100vh - 74px);flex:1 1 0;min-height:0;max-width:1900px;margin:0 auto;padding:12px;display:grid;grid-template-columns:minmax(430px,.88fr) minmax(620px,1.32fr);gap:12px;overflow:hidden}
+    .boomer-main{width:100%;height:calc(100dvh - 74px);flex:1 1 0;min-height:0;max-width:1900px;margin:0 auto;padding:12px;display:grid;grid-template-columns:minmax(430px,.88fr) minmax(620px,1.32fr);gap:12px;overflow:auto;align-content:start;scrollbar-gutter:stable both-edges}
     .left-column,.right-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0}
-    .right-column{overflow:hidden;min-height:0}
+    .right-column{overflow:visible;min-height:0}
     .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:var(--shadow);min-width:0}
     .list-panel{display:flex;flex-direction:column;flex:1;min-height:0}
     .panel-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
@@ -989,6 +989,7 @@ HTML_UI = r"""<!DOCTYPE html>
     .detail-pre{white-space:pre-wrap;margin:8px 0 0;font:inherit;font-size:12px;max-height:180px;overflow:auto}
     #reloadDetailBtn{min-height:34px;padding:6px 10px;font-size:11px}
     #rollbackBtn{min-height:34px;padding:6px 10px;font-size:11px;white-space:nowrap}
+    .panel-heading .toolbar{flex-wrap:wrap;justify-content:flex-end}
     button.danger:hover{background:#8e2630;color:#fff}
     .qr-dock{display:grid;grid-template-columns:64px minmax(0,1fr);grid-template-areas:'thumb copy' 'actions actions' 'status status';gap:8px 10px;align-items:start;margin-top:9px;padding:8px 10px;border:1px solid #dfe9e1;border-radius:11px;background:#fbfdfb;width:100%;min-width:0}
     .qr-dock.hidden{display:none!important}
@@ -1004,7 +1005,7 @@ HTML_UI = r"""<!DOCTYPE html>
     #sendQrTabletBtn.danger{background:#a8323c;border-color:#922934;color:#fff}
     #sendQrTabletBtn.danger:hover{background:#8e2630;color:#fff}
     #sendQrTabletBtn:disabled{opacity:.5}
-    .action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+    .action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:stretch}
     .action-grid:has(#acceptanceCard.hidden){grid-template-columns:1fr}
     #acceptanceCard,#signCard,#closedFirCard{min-width:0;padding:13px}
     #closedFirCard{background:var(--ok-bg);border-color:#b8daba}
@@ -1031,7 +1032,7 @@ HTML_UI = r"""<!DOCTYPE html>
     #usbCertSelect{height:40px;font-size:12px}
     #usbMemoryNote,#roleHint,.small-note{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.3}
     #usbCertSummary{padding:8px 10px;font-size:12px;margin-top:6px}
-    #usbSignBtn{width:100%;margin-top:10px;min-height:50px;font-size:16px}
+    #usbSignBtn{width:100%;margin-top:10px;min-height:48px;font-size:15px}
     #signBanner{margin-top:8px;font-size:13px}
     .debug-tools{padding:9px 11px;font-size:12px;background:#f8faf8}
     .debug-tools h2{font-size:13px;margin:0}
@@ -1045,7 +1046,34 @@ HTML_UI = r"""<!DOCTYPE html>
     .pdf-modal-inner{width:min(96vw,1200px);height:min(94vh,900px);background:#fff;border-radius:16px;padding:12px;display:flex;flex-direction:column;gap:9px}
     .pdf-modal iframe{width:100%;flex:1;min-height:0;border:1px solid var(--line);border-radius:9px}
     .muted{color:var(--muted)}
-    @media (max-width:1250px){.boomer-main{grid-template-columns:minmax(360px,.9fr) minmax(520px,1.1fr)}.summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+
+@media (max-width:1650px), (max-height:920px){
+  header{height:58px;flex:0 0 58px;padding:6px 14px}
+  .brand-mark{width:36px;height:36px;flex-basis:36px;font-size:14px}
+  .brand-title{font-size:16px}
+  .brand-subtitle{display:none}
+  .boomer-main{height:calc(100dvh - 58px);padding:10px;grid-template-columns:1fr;gap:10px}
+  .card{padding:12px;border-radius:14px}
+  .list-panel,.detail-panel{padding:12px}
+  .panel-heading{margin-bottom:8px}
+  h2{font-size:17px}
+  .intro{font-size:11px}
+  .filterbar{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}
+  .more-filters-content{grid-template-columns:1fr 1fr}
+  .action-grid{grid-template-columns:1fr}
+  .summary{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .extra-detail .detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .qr-dock{grid-template-columns:1fr;grid-template-areas:'thumb' 'copy' 'actions' 'status'}
+  .qr-thumb-wrap{justify-content:flex-start}
+  .qr-actions{flex-direction:column;align-items:stretch}
+  .qr-pdf-button{flex:1 1 auto;width:100%}
+  .acceptance-fields{grid-template-columns:1fr}
+  .cert-actions{grid-template-columns:1fr}
+  #usbSignBtn{min-height:46px;font-size:15px}
+  .acceptance-actions button{min-height:44px}
+  #rollbackBtn,#reloadDetailBtn{min-height:38px}
+}
+    @media (max-width:1250px){.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.extra-detail .detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
     @media (max-width:1000px){html,body{height:auto;min-height:100%;overflow:auto}.boomer-main{height:auto;min-height:calc(100vh - 66px);grid-template-columns:1fr;overflow:visible}.left-column{min-height:520px}.right-column{overflow:visible}.table-wrap{min-height:360px}.summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
     @media (max-width:650px){header{padding:8px 10px}.brand-title{font-size:15px}.brand-mark{width:36px;height:36px;flex-basis:36px}#subtitle{display:none}.boomer-main{padding:8px}.filterbar{grid-template-columns:1fr 1fr}.search-button{grid-column:1/-1}.action-grid{grid-template-columns:1fr!important}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.acceptance-fields{grid-template-columns:1fr 1fr}.qr-dock{flex-wrap:wrap}.qr-pdf-button{flex:1}}
   </style>
@@ -1143,7 +1171,7 @@ HTML_UI = r"""<!DOCTYPE html>
         </div>
         <div class="toolbar" style="flex-wrap:wrap;justify-content:flex-end">
           <button class="secondary" id="toggleHiddenFirBtn" type="button" onclick="toggleHiddenSelectedFir()" disabled>Nascondi formulario</button>
-          <button class="danger" id="rollbackBtn" onclick="rollbackSignature()" disabled>ANNULLA FIRMA FIR SELEZIONATO</button>
+          <button class="danger" id="rollbackBtn" onclick="rollbackSignature()" disabled>ANNULLA ULTIMA FIRMA</button>
           <button class="secondary" id="reloadDetailBtn" onclick="reloadDetail()" disabled>Aggiorna dati</button>
         </div>
       </div>
